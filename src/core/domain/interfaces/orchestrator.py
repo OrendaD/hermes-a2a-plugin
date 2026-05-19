@@ -29,6 +29,8 @@ class Orchestrator(ABC):
         task_id: str,
         context_id: str,
         parent_task_id: Optional[str] = None,
+        target_profile: Optional[str] = None,
+        target_node: Optional[str] = None,
     ) -> None:
         """Register a task for lifecycle monitoring.
 
@@ -36,6 +38,8 @@ class Orchestrator(ABC):
             task_id: The task to track.
             context_id: Conversation grouping identifier.
             parent_task_id: If this is a sub-task, the parent's task ID.
+            target_profile: The profile executing this task (for FC release).
+            target_node: The node the profile lives on.
         """
         ...
 
