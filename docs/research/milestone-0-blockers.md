@@ -188,6 +188,61 @@ def get_capabilities(self) -> list[AgentCapability]:
 
 ---
 
+## Appendix: v1.0 AgentCard Field Mapping
+
+Clarifications discovered during M0.3 validation testing. The a2a-sdk v1.0.3 protobuf types differ from the spec documentation examples in several field names.
+
+### AgentCard
+
+```python
+from a2a.types import AgentCard, AgentCapabilities, AgentSkill, AgentInterface
+
+card = AgentCard(
+    name="Tesla Mesh Node",
+    description="Hermes agent on VPS",
+    url="",                                    # ❌ Removed in v1.0
+    version="1.0.0",                           # ✅ Still present
+    default_input_modes=["text/plain"],         # ✅ Moved from AgentCapabilities
+    default_output_modes=["text/plain"],        # ✅ Moved from AgentCapabilities
+    capabilities=AgentCapabilities(
+        streaming=True,
+        # push_notifications=True              # ❌ Field named differently or absent
+    ),
+    skills=[AgentSkill(...)],
+    supported_interfaces=[
+        AgentInterface(
+            protocol_binding="JSONRPC",
+            protocol_version="1.0",
+            url="http://100.96.0.2:8081",      # ✅ url lives here now
+        )
+    ],
+)
+```
+
+### Key Deltas (from v0.3 to v1.0)
+
+| Field | v0.3 | v1.0 |
+|-------|------|------|
+| `AgentCard.url` | Top-level field | Removed — use `supported_interfaces[i].url` |
+| `AgentCapabilities.push_notifications` | Named field | Check actual proto descriptor — may be `push` or absent |
+| `AgentCapabilities.input_modes` | On Capabilities | Moved to `AgentCard.default_input_modes` |
+| `AgentCapabilities.output_modes` | On Capabilities | Moved to `AgentCard.default_output_modes` |
+| `TaskState` enum | `snake_case` | `SCREAMING_SNAKE_CASE` |
+
+### How to discover exact fields on your machine (macOS or Linux)
+
+```bash
+python -c "
+from a2a.types import AgentCard, AgentCapabilities, AgentSkill
+import inspect
+print('AgentCard fields:', [f for f in AgentCard.model_fields.keys()])
+print('AgentCapabilities fields:', [f for f in AgentCapabilities.model_fields.keys()])
+print('AgentSkill fields:', [f for f in AgentSkill.model_fields.keys()])
+"
+```
+
+---
+
 ## Summary
 
 | Blocker | v1 Recommendation | Production Path |
