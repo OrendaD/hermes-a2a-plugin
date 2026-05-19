@@ -228,6 +228,11 @@ card = AgentCard(
 | `AgentCapabilities.input_modes` | On Capabilities | Moved to `AgentCard.default_input_modes` |
 | `AgentCapabilities.output_modes` | On Capabilities | Moved to `AgentCard.default_output_modes` |
 | `TaskState` enum | `snake_case` | `SCREAMING_SNAKE_CASE` |
+| `Task.status` field | `state` | `status` (a `TaskStatus` message object, not a string enum) |
+| `Role` enum | lowercase (`user`, `agent`) | `ROLE_USER`, `ROLE_AGENT` — SCREAMING_SNAKE |
+| JSON-RPC method names | kebab-case (`message/send`, `tasks/get`) | PascalCase (`SendMessage`, `GetTask`, `ListTasks`) |
+| `AgentExecutor` ABC | `execute()` only | `execute()` + `cancel()` |
+| `SendMessage` handler | No config needed | Requires `return_immediately` logic in handler |
 
 ### How to discover exact fields on your machine (macOS or Linux)
 
