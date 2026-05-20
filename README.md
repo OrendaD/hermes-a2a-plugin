@@ -1,14 +1,24 @@
 # A2A Core — Hermes Plugin for Agent-to-Agent Protocol v1.0
 
-Implementation of Google's [A2A Protocol v1.0](https://a2a-protocol.org/) as a Hermes plugin. Protocol-agnostic domain models with hexagonal adapter architecture.
+Active production A2A Protocol v1.0 server as a Hermes plugin. Protocol-agnostic domain models with hexagonal adapter architecture.
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/OrendaD/a2a-plugin.git
 cd a2a-plugin
-bash setup.sh          # bootstrap: install deps, run tests, configure profiles
-python scripts/start-server.py --port 9696   # standalone server (mock dispatch)
+
+# Install in Hermes venv
+~/.hermes/hermes-agent/venv/bin/pip install -e '.[all]'
+
+# Create plugin symlink
+ln -sf $(pwd)/src/a2a_plugin ~/.hermes/plugins/a2a-server
+
+# Add to config.yaml (see setup docs)
+# ...
+
+# Restart gateway
+hermes gateway restart
 ```
 
 ## Architecture
@@ -66,19 +76,20 @@ a2a-plugin/
     skill-refs/           # Hermes skill reference files for A2A integration
     decisions/            # ADR-001: signing algorithm & key storage
     research/             # Milestone 0 blockers research
-    A2A-PLUGIN-HANDOFF-TO-TESLA.md  # Complete handoff document
-  setup.sh               # One-command environment bootstrap (idempotent)
+    SETUP-FOR-PROTEUS.md  # Cross-node test setup instructions
+    A2A-PLUGIN-HANDOFF-TO-TESLA.md  # Original handoff (state as of handover, not current)
+  setup.sh               # Environment bootstrap
 ```
 
 ## Test Suite
 
 ```bash
-# All tests (177)
+# All tests (254)
 python -m pytest tests/ -q
 
 # By layer
 python -m pytest tests/core/ -q    # 71 tests — < 0.2s
-python -m pytest tests/adapter/ -q # 106 tests — < 2s
+python -m pytest tests/adapter/ -q # 183+ tests — < 3s
 ```
 
 ## Gateway Integration
@@ -110,16 +121,16 @@ curl -X POST http://127.0.0.1:9696/a2a/jsonrpc \
 
 ## Key Gaps to Close
 
+All foundational pieces are in place. Remaining work per delivery plan:
+
 | Priority | Gap | Effort |
 |----------|-----|--------|
-| P0 | Real dispatch (gateway restart) | 30 min |
-| P0 | Bearer token auth | 1-2 days |
-| P0 | Outbound A2A client + mesh peering | 2-3 days |
-| P1 | SQLite persistence | 1 day |
-| P1 | Implement cancel() | 4 hours |
-| P1 | Fix Agent Card signing | 4 hours |
-| P2 | SSRF guard | 1 day |
-| P2 | Wire Orchestrator | 4 hours |
+| P0 | Cross-node dispatch test (Tesla ↔ Proteus) | 1 session |
+| P1 | Wire Orchestrator + SQLite persistence | 2-3 days |
+| P1 | Streaming (SSE) | 2-3 days |
+| P2 | Audit logging | 1 day |
+| P2 | Auth enforcement | 4 hours |
+| P3 | Rate limiting, provenance, hardening | 2-3 days |
 
 Full details: `docs/A2A-PLUGIN-HANDOFF-TO-TESLA.md`
 
