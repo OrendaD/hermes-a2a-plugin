@@ -190,6 +190,8 @@ def get_capabilities(self) -> list[AgentCapability]:
 
 ## Appendix: v1.0 AgentCard Field Mapping
 
+> **Note on key storage:** The original M1.1 recommendation "a2a: section in profile config.yaml" was replaced by ADR-001. Signing keys live in per-profile `.env` files, not config.yaml or a separate keys directory. See [ADR-001](../decisions/adr-001-signing.md) for the full decision record.
+
 Clarifications discovered during M0.3 validation testing. The a2a-sdk v1.0.3 protobuf types differ from the spec documentation examples in several field names.
 
 ### AgentCard
@@ -224,25 +226,42 @@ card = AgentCard(
 | Field | v0.3 | v1.0 |
 |-------|------|------|
 | `AgentCard.url` | Top-level field | Removed — use `supported_interfaces[i].url` |
-| `AgentCapabilities.push_notifications` | Named field | Check actual proto descriptor — may be `push` or absent |
+| `AgentCapabilities.push_notifications` | Named field | `push_notifications` (verified: protobuf descriptor has it) |
 | `AgentCapabilities.input_modes` | On Capabilities | Moved to `AgentCard.default_input_modes` |
 | `AgentCapabilities.output_modes` | On Capabilities | Moved to `AgentCard.default_output_modes` |
 | `TaskState` enum | `snake_case` | `SCREAMING_SNAKE_CASE` |
-| `Task.status` field | `state` | `status` (a `TaskStatus` message object, not a string enum) |
-| `Role` enum | lowercase (`user`, `agent`) | `ROLE_USER`, `ROLE_AGENT` — SCREAMING_SNAKE |
-| JSON-RPC method names | kebab-case (`message/send`, `tasks/get`) | PascalCase (`SendMessage`, `GetTask`, `ListTasks`) |
-| `AgentExecutor` ABC | `execute()` only | `execute()` + `cancel()` |
-| `SendMessage` handler | No config needed | Requires `return_immediately` logic in handler |
+|| `Task.status` field | `state` | `status` (a `TaskStatus` message object, not a string enum) |
+|| `Role` enum | lowercase (`user`, `agent`) | `ROLE_USER`, `ROLE_AGENT` — SCREAMING_SNAKE |
+|| JSON-RPC method names | kebab-case (`message/send`, `tasks/get`) | PascalCase (`SendMessage`, `GetTask`, `ListTasks`) |
+|| `AgentExecutor` ABC | `execute()` only | `execute()` + `cancel()` |
+|| `SendMessage` handler | No config needed | Requires `return_immediately` logic in handler |
+|| `A2A-Version` header | Default: none | **Required.** Defaults to `0.3` if missing. Must send `A2A-Version: 1.0` |
+|| `AgentProvider.origin` | Named field | **Removed.** Use `AgentProvider.url` for URL, `AgentProvider.organization` for name |
+|| `AgentSkill` fields | Spec docs show `id`, `name`, `description`, `tags`, `examples` | ✅ Matches — verified by `build_agent_card()` |
+|| `SendMessage` required fields | Minimal | **Requires** `message.message_id`, `A2A-Version` header, `role` as `ROLE_USER`/`ROLE_AGENT` |
 
 ### How to discover exact fields on your machine (macOS or Linux)
 
+**Protobuf descriptor (always authoritative):**
 ```bash
 python -c "
-from a2a.types import AgentCard, AgentCapabilities, AgentSkill
-import inspect
-print('AgentCard fields:', [f for f in AgentCard.model_fields.keys()])
-print('AgentCapabilities fields:', [f for f in AgentCapabilities.model_fields.keys()])
-print('AgentSkill fields:', [f for f in AgentSkill.model_fields.keys()])
+from a2a.types import AgentCard, AgentCapabilities, AgentSkill, AgentProvider, AgentInterface
+for name, cls in [('AgentCard', AgentCard), ('AgentCapabilities', AgentCapabilities),
+                  ('AgentSkill', AgentSkill), ('AgentProvider', AgentProvider),
+                  ('AgentInterface', AgentInterface)]:
+    print(f'{name} fields:')
+    for f in cls.DESCRIPTOR.fields:
+        print(f'  {f.name} (type={f.type})')
+    print()
+"
+```
+
+**For protobuf wrappers (no `DESCRIPTOR`):**
+```bash
+python -c "
+from google.protobuf.json_format import ParseDict
+from a2a.types import ExampleType
+# Construct an instance and use MessageToDict to discover keys
 "
 ```
 

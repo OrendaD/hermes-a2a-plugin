@@ -1,0 +1,490 @@
+"""HermesExecutor — translates A2A requests to Hermes sessions and back.
+
+SDK-pure. No Hermes imports. Injected with dispatch function and
+Fleet Controller at construction time.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any, Callable, Optional
+
+from a2a.server.agent_execution.agent_executor import AgentExecutor
+from a2a.server.agent_execution.context import RequestContext
+from a2a.server.events.event_queue import EventQueue
+from a2a.types import (
+    Task,
+    TaskState,
+    TaskStatus,
+    TaskStatusUpdateEvent,
+    Message,
+    Part,
+    Role,
+)
+
+from core.domain.models.intent import TaskIntent
+from core.domain.models.result import TaskResult
+from core.domain.models.dispatch import ProfileDispatch
+from core.domain.interfaces.fleet_controller import FleetController
+
+# Signature of the injected dispatch function.
+# Takes a goal string and optional profile name, returns a TaskResult.
+DispatchFn = Callable[
+    [str, Optional[str]],
+    TaskResult,
+]
+
+
+class HermesExecutor(AgentExecutor):
+    """Translates A2A requests into Hermes agent sessions via
+    an injected dispatch function.
+
+    The dispatch function is provided by the plugin at construction time
+    and encapsulates the Hermes-specific session spawn logic. In tests,
+    a mock dispatch function is used instead.
+
+    Args:
+        dispatch_fn: A callable that accepts ``(goal, profile)`` and
+            returns a ``TaskResult``. The plugin wires this to
+            ``ctx.dispatch_tool("delegate_task", ...)`` at startup.
+        fc: A FleetController instance used for routing decisions and
+            availability tracking.
+    """
+
+    def __init__(
+        self,
+        dispatch_fn: DispatchFn,
+        fc: FleetController,
+    ) -> None:
+        self._dispatch = dispatch_fn
+        self._fc = fc
+
+    # ------------------------------------------------------------------
+    # AgentExecutor contract
+    # ------------------------------------------------------------------
+
+    async def execute(
+        self, context: RequestContext, event_queue: EventQueue
+    ) -> None:
+        """Execute an A2A request through the Hermes dispatch pipeline.
+
+        Flow:
+        1. Translate ``RequestContext`` → ``TaskIntent``
+        2. Route via ``FleetController.route()``
+        3. If no route found: emit ``FAILED``, return
+        4. Call ``dispatch_fn(goal, profile)`` → ``TaskResult``
+        5. Emit result ``Message`` + ``TaskStatusUpdateEvent``
+
+        Args:
+            context: The SDK request context.
+            event_queue: The SDK event queue.
+        """
+        # 1. Translate
+        intent = self.request_to_intent(context)
+
+        # 2. Route
+        dispatch = self._fc.route(intent)
+
+        # 3. Check if routed successfully
+        if not dispatch.is_successful:
+            error_msg = (
+                dispatch.message
+                or f"No profile available for intent '{intent.intent_type}' "
+                f"(status: {dispatch.status})"
+            )
+            await event_queue.enqueue_event(Message(
+                message_id=str(uuid.uuid4()),
+                task_id=context.task_id,
+                context_id=context.context_id or "",
+                role=Role.ROLE_AGENT,
+                parts=[Part(text=error_msg)],
+            ))
+            return
+
+        # 4. Execute the task via dispatch function
+        goal = intent.payload.get("question", "")
+        profile = dispatch.profile_name
+        try:
+            result = self._dispatch(goal, profile)
+        except Exception as exc:
+            await event_queue.enqueue_event(Message(
+                message_id=str(uuid.uuid4()),
+                task_id=context.task_id,
+                context_id=context.context_id or "",
+                role=Role.ROLE_AGENT,
+                parts=[Part(text=f"Execution error: {exc}")],
+            ))
+            return
+
+        # 5. Emit result — message-only mode.
+        # The SDK supports two patterns:
+        #   - Message-only: emit a single Message, nothing else.
+        #     Handler returns it to the client immediately.
+        #   - Long-running task: emit Task (initial), then Message,
+        #     then TaskStatusUpdateEvent(COMPLETED).
+        # For our synchronous dispatch_fc pattern, message-only is
+        # simpler and avoids the "must enqueue Task before
+        # TaskStatusUpdateEvent" protocol requirement.
+        if result.status == "completed":
+            answer = ""
+            if result.data and "answer" in result.data:
+                answer = str(result.data["answer"])
+            elif result.data:
+                answer = str(result.data)
+
+            if answer:
+                await event_queue.enqueue_event(Message(
+                    message_id=str(uuid.uuid4()),
+                    task_id=context.task_id,
+                    context_id=context.context_id or "",
+                    role=Role.ROLE_AGENT,
+                    parts=[Part(text=answer)],
+                ))
+            else:
+                # No answer text but completed — still emit a message
+                await event_queue.enqueue_event(Message(
+                    message_id=str(uuid.uuid4()),
+                    task_id=context.task_id,
+                    context_id=context.context_id or "",
+                    role=Role.ROLE_AGENT,
+                    parts=[Part(text="Task completed.")],
+                ))
+        else:
+            # FAILED, CANCELLED, or INPUT_REQUIRED
+            status_text = result.error or f"Status: {result.status}"
+            await event_queue.enqueue_event(Message(
+                message_id=str(uuid.uuid4()),
+                task_id=context.task_id,
+                context_id=context.context_id or "",
+                role=Role.ROLE_AGENT,
+                parts=[Part(text=status_text)],
+            ))
+
+    async def cancel(
+        self, context: RequestContext, event_queue: EventQueue
+    ) -> None:
+        """Cancel a running task.
+
+        Emits a ``TaskStatusUpdateEvent`` with ``TASK_STATE_CANCELED``
+        and a brief ``Message`` explaining the cancellation.
+
+        Full Hermes session cancellation (killing the subagent process)
+        requires the dispatch function to support a cancel counterpart.
+        Until that's wired, this satisfies the A2A protocol contract by
+        emitting the required events.
+
+        Args:
+            context: The request context containing the task ID to cancel.
+            event_queue: The queue to publish the cancellation events to.
+        """
+        task_id = context.task_id or "unknown"
+        context_id = context.context_id or ""
+
+        await event_queue.enqueue_event(TaskStatusUpdateEvent(
+            task_id=task_id,
+            status=TaskStatus(state=TaskState.TASK_STATE_CANCELED)),
+        )
+        await event_queue.enqueue_event(Message(
+            message_id=str(uuid.uuid4()),
+            task_id=task_id,
+            context_id=context_id,
+            role=Role.ROLE_AGENT,
+            parts=[Part(text=f"Task {task_id} cancelled by user request.")],
+        ))
+
+    # ------------------------------------------------------------------
+    # Translation helpers
+    # ------------------------------------------------------------------
+
+    def request_to_intent(
+        self,
+        request_context: RequestContext,
+        source_node: str = "local",
+        source_profile: str = "a2a-adapter",
+    ) -> TaskIntent:
+        """Translate an A2A ``RequestContext`` into a ``TaskIntent``.
+
+        Intent type is derived from the message's parts using parts-based
+        inference (``_derive_intent_type``) unless the message metadata
+        contains an ``intent_type`` override.
+
+        Args:
+            request_context: The SDK request context.
+            source_node: Node ID of this Hermes instance.
+            source_profile: Profile name for the source field.
+
+        Returns:
+            A ``TaskIntent`` ready for Fleet Controller routing.
+        """
+        message = request_context.message
+        parts = list(message.parts) if message else []
+
+        # Metadata override — message.metadata is a google.protobuf.Struct
+        metadata: dict[str, Any] = {}
+        intent_type: str | None = None
+        if message and message.HasField("metadata"):
+            for key, value in message.metadata.fields.items():
+                metadata[key] = _struct_value_to_python(value)
+            intent_type = metadata.pop("intent_type", None)
+
+        if not intent_type:
+            intent_type = _derive_intent_type(parts)
+
+        # Build payload from parts
+        payload: dict[str, Any] = {"question": ""}
+        for part in parts:
+            if part.HasField("text"):
+                payload["question"] = part.text
+            if part.HasField("data"):
+                from google.protobuf.json_format import MessageToDict
+                payload["data"] = MessageToDict(
+                    part.data, preserving_proto_field_name=True
+                )
+            if part.HasField("url"):
+                file_info: dict[str, str | bytes] = {"url": part.url}
+                if part.filename:
+                    file_info["name"] = part.filename
+                if part.media_type:
+                    file_info["mime_type"] = part.media_type
+                payload["file"] = file_info
+            if part.HasField("raw"):
+                file_info = {"raw": part.raw}
+                if part.filename:
+                    file_info["name"] = part.filename
+                if part.media_type:
+                    file_info["mime_type"] = part.media_type
+                payload["file"] = file_info
+
+        return TaskIntent(
+            intent_type=intent_type,
+            payload=payload,
+            source_node=source_node,
+            source_profile=source_profile,
+            target_profile=None,  # FC decides
+            target_node=None,
+            context_id=request_context.context_id or "",
+            reference_task_ids=list(message.reference_task_ids) if message else [],
+            metadata=metadata,
+        )
+
+    def result_to_a2a_task(
+        self,
+        task_result: TaskResult,
+        task_id: str,
+        context_id: str,
+    ) -> Task:
+        """Translate a Hermes ``TaskResult`` into an A2A ``Task``.
+
+        Args:
+            task_result: The result from the Hermes session dispatch.
+            task_id: The A2A task ID to use.
+            context_id: The A2A context (conversation) ID.
+
+        Returns:
+            An A2A ``Task`` protobuf ready for the event queue.
+        """
+        state = _hermes_to_a2a_state(task_result.status)
+        a2a_task = Task(
+            id=task_id,
+            context_id=context_id,
+            status=TaskStatus(state=state),
+        )
+
+        # Map result data and messages as A2A parts
+        parts: list[Part] = []
+
+        if task_result.data:
+            if isinstance(task_result.data, dict) and "answer" in task_result.data:
+                parts.append(Part(text=str(task_result.data["answer"])))
+            else:
+                parts.append(Part(text=str(task_result.data)))
+
+        if task_result.messages:
+            for msg in task_result.messages:
+                if isinstance(msg, dict):
+                    content = msg.get("content") or msg.get("text") or str(msg)
+                    parts.append(Part(text=str(content)))
+
+        if task_result.artifacts:
+            for artifact in task_result.artifacts:
+                if isinstance(artifact, dict):
+                    parts.append(Part(
+                        text=artifact.get("content", ""),
+                        metadata={"name": artifact.get("name", "")},
+                    ))
+
+        if parts:
+            # Emit these as a message alongside the task
+            pass  # handled by emit_status_event
+
+        return a2a_task
+
+    def emit_status_event(
+        self,
+        task_id: str,
+        state: TaskState.ValueType,
+        event_queue: EventQueue,
+        final: bool = False,
+    ) -> None:
+        """Emit a ``TaskStatusUpdateEvent`` to the event queue.
+
+        The SDK's ``DefaultRequestHandlerV2`` picks this up and
+        translates it into the appropriate A2A response.
+
+        Args:
+            task_id: The A2A task ID.
+            state: The terminal or intermediate state.
+            event_queue: The SDK event queue.
+            final: Whether this is the final event for this task.
+        """
+        import asyncio
+        update = TaskStatusUpdateEvent(
+            id=task_id,
+            status=TaskStatus(state=state),
+            final=final,
+        )
+        # event_queue.enqueue is async — the caller (execute()) is
+        # responsible for calling this in an async context
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                asyncio.ensure_future(event_queue.enqueue(update))
+            else:
+                raise RuntimeError("No running event loop for event_queue.enqueue")
+        except RuntimeError:
+            raise RuntimeError(
+                "Cannot emit event: no running async event loop. "
+                "This should only be called from within execute()."
+            )
+
+    def emit_message(
+        self,
+        task_id: str,
+        context_id: str,
+        parts: list[Part],
+        event_queue: EventQueue,
+        role: Role.ValueType = Role.ROLE_AGENT,
+    ) -> None:
+        """Emit an A2A ``Message`` to the event queue.
+
+        Args:
+            task_id: The A2A task ID.
+            context_id: The A2A context (conversation) ID.
+            parts: The message parts to include.
+            event_queue: The SDK event queue.
+            role: The message role (default ``ROLE_AGENT``).
+        """
+        import asyncio
+        msg = Message(
+            message_id=str(uuid.uuid4()),
+            task_id=task_id,
+            context_id=context_id,
+            role=role,
+            parts=parts,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                asyncio.ensure_future(event_queue.enqueue(msg))
+            else:
+                raise RuntimeError("No running event loop for event_queue.enqueue")
+        except RuntimeError:
+            raise RuntimeError(
+                "Cannot emit event: no running async event loop. "
+                "This should only be called from within execute()."
+            )
+
+
+# ------------------------------------------------------------------
+# Module-level helpers
+# ------------------------------------------------------------------
+
+
+def _derive_intent_type(parts: list) -> str:
+    """Derive an A2A intent type from the message's parts.
+
+    A ``Part`` is a oneof of ``text``, ``raw``, ``url``, ``data``.
+    We check all parts in the message:
+
+    - Any part with ``HasField('data')`` → ``"action_request"``
+    - Any part with ``HasField('url')`` or ``HasField('raw')`` → ``"consultation"``
+    - Any part with ``HasField('text')`` (or empty) → ``"consultation"``
+    """
+    for part in parts:
+        if part.HasField("data"):
+            return "action_request"
+
+    has_text = False
+    for part in parts:
+        if part.HasField("url") or part.HasField("raw"):
+            return "consultation"
+        if part.HasField("text"):
+            has_text = True
+
+    if has_text or not parts:
+        return "consultation"
+    return "consultation"
+
+
+def _hermes_to_a2a_state(hermes_status: str) -> TaskState.ValueType:
+    """Map a Hermes ``TaskResult.status`` to an A2A ``TaskState``."""
+    mapping: dict[str, TaskState.ValueType] = {
+        "completed": TaskState.TASK_STATE_COMPLETED,
+        "failed": TaskState.TASK_STATE_FAILED,
+        "cancelled": TaskState.TASK_STATE_CANCELED,
+        "input_required": TaskState.TASK_STATE_INPUT_REQUIRED,
+    }
+    return mapping.get(hermes_status, TaskState.TASK_STATE_FAILED)
+
+
+def _default_dispatch(goal: str, profile: Optional[str]) -> TaskResult:
+    """fallback dispatch for use when no real dispatch is wired.
+
+    Raises RuntimeError if called. Exists so the executor can be
+    constructed without a dispatch function for testing purposes.
+    """
+    raise RuntimeError(
+        "No dispatch function configured. "
+        "Wire one via HermesExecutor(dispatch_fn=...) at plugin startup."
+    )
+
+
+def _struct_value_to_python(value: Any) -> Any:
+    """Convert a ``google.protobuf.Value`` to a native Python type.
+
+    Handles nested structs, lists, strings, numbers, booleans, and null.
+    """
+    from google.protobuf.struct_pb2 import Value, ListValue, Struct
+
+    if isinstance(value, Value):
+        which = value.WhichOneof("kind")
+        if which == "struct_value":
+            return {
+                k: _struct_value_to_python(v)
+                for k, v in value.struct_value.fields.items()
+            }
+        if which == "list_value":
+            return [
+                _struct_value_to_python(v) for v in value.list_value.values
+            ]
+        if which == "string_value":
+            return value.string_value
+        if which == "number_value":
+            return value.number_value
+        if which == "bool_value":
+            return value.bool_value
+        if which == "null_value":
+            return None
+        return None
+
+    if isinstance(value, Struct):
+        return {
+            k: _struct_value_to_python(v)
+            for k, v in value.fields.items()
+        }
+
+    if isinstance(value, ListValue):
+        return [_struct_value_to_python(v) for v in value.values]
+
+    return value

@@ -1,13 +1,37 @@
 [build-system]
 requires = ["setuptools>=68"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "a2a-core"
 version = "0.1.0"
-description = "A2A Core Layer — protocol-agnostic domain models and orchestration"
+description = "A2A Core Layer — protocol-agnostic domain models and orchestration for Hermes Agent-to-Agent communication"
 requires-python = ">=3.10"
+
+dependencies = [
+    "a2a-sdk[http-server,signing]>=1.0.0",
+    "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+]
+sqlite = [
+    "a2a-sdk[sqlite]>=1.0.0",
+]
+all = [
+    "a2a-core[dev,sqlite]",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+a2a-server = "a2a_plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_mode = "auto"
