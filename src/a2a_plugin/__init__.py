@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import threading
+import uuid
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -34,8 +36,11 @@ from starlette.routing import Route
 
 from adapter.agent_card_builder import build_agent_card
 from adapter.agent_card_route import create_agent_card_route
+from adapter.auth_context_builder import BearerTokenContextBuilder
 from adapter.hermes_executor import HermesExecutor
+from adapter.peer_registry import PeerConfig, PeerRegistry
 from adapter.profile_discovery import discover_profiles
+from adapter.version_middleware import A2AVersionMiddleware
 from core.domain.models.result import TaskResult
 from core.fleet_controller import FleetControllerImpl
 
@@ -53,7 +58,7 @@ _fleet_controller: FleetControllerImpl | None = None
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_PORT = 8081
+DEFAULT_PORT = 9696
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_NODE_NAME = "hermes-a2a-node"
 DEFAULT_PROFILES_DIR = "~/.hermes/profiles"
@@ -80,6 +85,8 @@ def _read_a2a_config() -> dict[str, Any]:
         "node_name": a2a.get("node_name", DEFAULT_NODE_NAME),
         "profiles_dir": a2a.get("profiles_dir", DEFAULT_PROFILES_DIR),
         "node_id": a2a.get("node_id", "local"),
+        "signing_profile": a2a.get("signing_profile"),
+        "peers": a2a.get("peers", []),
     }
 
 
@@ -113,6 +120,7 @@ def _build_app(
         node_name=node_name,
         node_description=f"Hermes A2A node ({node_name})",
         interface_url=f"http://{config['bind']}:{config['port']}",
+        signing_profile=config.get("signing_profile"),
     )
 
     async def _health(request):
@@ -126,7 +134,9 @@ def _build_app(
     if jsonrpc_routes:
         routes.extend(jsonrpc_routes)
 
-    return Starlette(routes=routes)
+    app = Starlette(routes=routes)
+    app.add_middleware(A2AVersionMiddleware)
+    return app
 
 
 def _start_server(app: Starlette, config: dict[str, Any]) -> threading.Thread:
@@ -159,6 +169,189 @@ def _start_server(app: Starlette, config: dict[str, Any]) -> threading.Thread:
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Dispatch: AIAgent-based (replaces old dispatch_tool closure)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_runtime(profile_name: str, a2a_config: dict) -> dict:
+    """Read runtime config from a profile's ``config.yaml``.
+
+    Args:
+        profile_name: The profile name (subdirectory under ``profiles_dir``).
+        a2a_config: Plugin configuration dict (from ``_read_a2a_config()``).
+
+    Returns:
+        Dict with optional keys: ``model``, ``provider``, ``base_url``,
+        ``api_mode``. Returns empty dict if the profile config doesn't exist
+        or can't be read.
+    """
+    profiles_dir = Path(
+        os.path.expanduser(a2a_config.get("profiles_dir", DEFAULT_PROFILES_DIR))
+    )
+    config_path = profiles_dir / profile_name / "config.yaml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        import yaml
+
+        cfg = yaml.safe_load(config_path.read_text())
+        if not isinstance(cfg, dict):
+            return {}
+        model_cfg = cfg.get("model", {})
+        if not isinstance(model_cfg, dict):
+            return {}
+        return {
+            "model": model_cfg.get("default"),
+            "provider": model_cfg.get("provider"),
+            "base_url": model_cfg.get("base_url"),
+            "api_mode": model_cfg.get("api_mode"),
+        }
+    except Exception as exc:
+        logger.debug(
+            "a2a-server: failed to read profile config %s: %s",
+            config_path,
+            exc,
+        )
+        return {}
+
+
+def _run_via_agent(
+    goal: str,
+    profile_name: str | None = None,
+) -> TaskResult:
+    """Dispatch a goal through a fresh ``AIAgent`` in the daemon thread.
+
+    Replaces the old ``_dispatch_fn`` closure that called ``ctx.dispatch_tool``
+    (``"delegate_task", ...)``, which fails in the A2A daemon thread because
+    there is no active ``AIAgent`` session.
+
+    Follows the ``AIAgent`` construction pattern from ``cron/scheduler.py:1437``.
+
+    Args:
+        goal: The user's request text to process.
+        profile_name: Optional target profile name for routing.
+
+    Returns:
+        ``TaskResult(status="completed", data={"answer": response})`` on success,
+        or ``TaskResult(status="failed", error=...)`` on failure.
+    """
+    task_id = str(uuid.uuid4())
+    session_id = f"a2a_{task_id[:12]}"
+
+    try:
+        # 1. Resolve profile-level runtime config
+        a2a_config = _read_a2a_config()
+        runtime = _resolve_runtime(profile_name, a2a_config) if profile_name else {}
+
+        # 2. Fall back to main Hermes config defaults for missing values
+        from hermes_cli.config import load_config
+
+        main_cfg = load_config()
+        model_cfg = main_cfg.get("model", {}) if isinstance(main_cfg, dict) else {}
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+
+        model = runtime.get("model") or model_cfg.get("default") or ""
+        provider = runtime.get("provider") or model_cfg.get("provider") or ""
+        base_url = runtime.get("base_url") or model_cfg.get("base_url") or ""
+        api_mode = runtime.get("api_mode") or model_cfg.get("api_mode") or ""
+
+        # 3. Lazy-import AIAgent (avoids loading the full agent machinery
+        #    at plugin registration time — same pattern as cron/scheduler.py)
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model=model or None,
+            api_key=None,  # AIAgent resolves from env / config internally
+            base_url=base_url or None,
+            provider=provider or None,
+            api_mode=api_mode or None,
+            max_iterations=60,
+            enabled_toolsets=[
+                "terminal",
+                "file",
+                "web",
+            ],
+            disabled_toolsets=[
+                "delegate_task",
+                "clarify",
+                "send_message",
+                "memory",
+                "cronjob",
+            ],
+            quiet_mode=True,
+            load_soul_identity=True,
+            skip_memory=True,
+            skip_context_files=True,
+            platform="a2a",
+            session_id=session_id,
+        )
+
+        # 4. Run the agent and return the result
+        response = agent.chat(goal)
+        return TaskResult(
+            status="completed",
+            data={"answer": response},
+        )
+
+    except Exception as exc:
+        logger.error(
+            "a2a-server: _run_via_agent failed for profile '%s': %s",
+            profile_name,
+            exc,
+            exc_info=True,
+        )
+        return TaskResult(
+            status="failed",
+            error=f"A2A dispatch error: {exc}",
+        )
+
+
+async def _connect_peers(mesh_client) -> None:
+    """Background task: connect all configured mesh peers.
+
+    Called fire-and-forget from the synchronous ``register()``. Logs
+    per-peer success/failure — does not raise.
+    """
+    try:
+        await mesh_client.connect_all()
+    except Exception as exc:
+        logger.error(
+            "a2a-server: peer connection background task failed: %s",
+            exc, exc_info=True,
+        )
+
+
+def _schedule_peer_connections(mesh_client) -> None:
+    """Schedule peer connections if an event loop is running.
+
+    ``register()`` is synchronous so we cannot ``await``. We fire
+    the connect as a background asyncio task so it runs on the server's
+    event loop. If no loop is running yet (rare at import time), the
+    connections are deferred — the first A2A request will have to
+    connect on-demand, which ``send_task`` handles gracefully by
+    returning ``failed`` for unconnected peers.
+    """
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_connect_peers(mesh_client))
+            logger.debug("a2a-server: scheduled async peer connections")
+        else:
+            logger.info(
+                "a2a-server: event loop not yet running, "
+                "peer connections deferred"
+            )
+    except RuntimeError:
+        logger.info(
+            "a2a-server: no event loop available, "
+            "peer connections deferred"
+        )
 
 
 def register(ctx) -> None:
@@ -233,6 +426,47 @@ def register(ctx) -> None:
     _fleet_controller = fc
 
     # ------------------------------------------------------------------
+    # Peer Registry — load configured peers (Phase 2)
+    # ------------------------------------------------------------------
+    def _resolve_env(val: str) -> str:
+        """Resolve ``${VAR_NAME}`` references in config values from env vars."""
+        if val.startswith("${") and val.endswith("}"):
+            return os.environ.get(val[2:-1], "")
+        return val
+
+    raw_peers: list[dict] = a2a_config.get("peers", [])
+    peer_configs = [
+        PeerConfig(
+            name=p["name"],
+            url=p["url"],
+            api_key=_resolve_env(p.get("api_key", "")),
+            cidr_allow=p.get("cidr_allow", []),
+        )
+        for p in raw_peers
+    ]
+    peer_registry = PeerRegistry(peer_configs)
+
+    if peer_configs:
+        logger.info(
+            "a2a-server: PeerRegistry loaded — %d peer(s) configured: %s",
+            len(peer_configs),
+            ", ".join(p.name for p in peer_configs),
+        )
+
+    # ------------------------------------------------------------------
+    # MeshPeerClient — outbound connections to configured peers (Phase 2+3)
+    # ------------------------------------------------------------------
+    from adapter.mesh_peer_client import MeshPeerClient
+
+    mesh_client = MeshPeerClient(peer_registry, fc)
+
+    # Fire-and-forget peer connections. We cannot await here because
+    # register() is synchronous. If there is a running event loop we
+    # schedule the connections; otherwise they are silently deferred
+    # until the first A2A request arrives (lazy-fallback pattern below).
+    _schedule_peer_connections(mesh_client)
+
+    # ------------------------------------------------------------------
     # HermesExecutor — A2A dispatch wiring (M3.4)
     # ------------------------------------------------------------------
     from a2a.server.request_handlers import DefaultRequestHandlerV2
@@ -262,37 +496,21 @@ def register(ctx) -> None:
 
     task_store = InMemoryTaskStore()
 
-    # Dispatch function: translates a (goal, profile) pair into a
-    # Hermes sub-agent invocation via delegate_task.
-    # The closure captures ctx (PluginContext) from register().
-    def _dispatch_fn(goal: str, profile_name: str | None = None) -> TaskResult:
-        args: dict[str, Any] = {"goal": goal}
-        if profile_name:
-            args["profile"] = profile_name
-        try:
-            result_json = ctx.dispatch_tool("delegate_task", args)
-            result_data = json.loads(result_json)
-            summary = result_data.get("summary", str(result_data))
-            return TaskResult(
-                status="completed",
-                data={"answer": summary},
-            )
-        except Exception as exc:
-            logger.error("a2a-server: dispatch_fn failed: %s", exc, exc_info=True)
-            return TaskResult(
-                status="failed",
-                error=f"Dispatch error: {exc}",
-            )
-
-    executor = HermesExecutor(dispatch_fn=_dispatch_fn, fc=fc)
+    # NOTE: dispatch_fn is the module-level _run_via_agent (defined above),
+    # which creates a fresh AIAgent directly instead of calling the
+    # ctx.dispatch_tool("delegate_task", ...) path that fails outside an
+    # active AIAgent session.
+    executor = HermesExecutor(dispatch_fn=_run_via_agent, fc=fc, mesh_client=mesh_client)
     handler = DefaultRequestHandlerV2(
         agent_executor=executor,
         task_store=task_store,
         agent_card=agent_card,
     )
+    context_builder = BearerTokenContextBuilder(peer_registry)
     jsonrpc_routes = create_jsonrpc_routes(
         request_handler=handler,
         rpc_url="/a2a/jsonrpc",
+        context_builder=context_builder,
     )
 
     logger.info(

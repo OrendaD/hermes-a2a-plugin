@@ -44,21 +44,30 @@ class HermesExecutor(AgentExecutor):
     and encapsulates the Hermes-specific session spawn logic. In tests,
     a mock dispatch function is used instead.
 
+    When the FleetController routes to a remote node (``endpoint``
+    starting with ``\"a2a://\"``), the executor delegates to an optional
+    ``MeshPeerClient`` instead of calling the local dispatch function.
+
     Args:
         dispatch_fn: A callable that accepts ``(goal, profile)`` and
             returns a ``TaskResult``. The plugin wires this to
-            ``ctx.dispatch_tool("delegate_task", ...)`` at startup.
+            ``ctx.dispatch_tool(\"delegate_task\", ...)`` at startup.
         fc: A FleetController instance used for routing decisions and
             availability tracking.
+        mesh_client: Optional ``MeshPeerClient`` for dispatching tasks
+            to remote mesh peers. If ``None``, remote endpoints are
+            treated as failures.
     """
 
     def __init__(
         self,
         dispatch_fn: DispatchFn,
         fc: FleetController,
+        mesh_client: Any = None,
     ) -> None:
         self._dispatch = dispatch_fn
         self._fc = fc
+        self._mesh_client = mesh_client
 
     # ------------------------------------------------------------------
     # AgentExecutor contract
@@ -73,8 +82,10 @@ class HermesExecutor(AgentExecutor):
         1. Translate ``RequestContext`` → ``TaskIntent``
         2. Route via ``FleetController.route()``
         3. If no route found: emit ``FAILED``, return
-        4. Call ``dispatch_fn(goal, profile)`` → ``TaskResult``
-        5. Emit result ``Message`` + ``TaskStatusUpdateEvent``
+        4. If ``endpoint`` starts with ``\"a2a://\"``: dispatch via
+           ``MeshPeerClient.send_task(intent)`` → ``TaskResult``
+        5. Otherwise: call ``dispatch_fn(goal, profile)`` → ``TaskResult``
+        6. Emit result ``Message`` + ``TaskStatusUpdateEvent``
 
         Args:
             context: The SDK request context.
@@ -102,11 +113,21 @@ class HermesExecutor(AgentExecutor):
             ))
             return
 
-        # 4. Execute the task via dispatch function
+        # 4. Dispatch — remote or local?
+        is_remote = dispatch.endpoint.startswith("a2a://")
         goal = intent.payload.get("question", "")
         profile = dispatch.profile_name
         try:
-            result = self._dispatch(goal, profile)
+            if is_remote:
+                # Remote dispatch via mesh peer client
+                if self._mesh_client is None:
+                    raise RuntimeError(
+                        "Remote dispatch required but no MeshPeerClient configured"
+                    )
+                result = await self._mesh_client.send_task(intent)
+            else:
+                # Local dispatch via Hermes AIAgent
+                result = self._dispatch(goal, profile)
         except Exception as exc:
             await event_queue.enqueue_event(Message(
                 message_id=str(uuid.uuid4()),

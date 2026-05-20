@@ -6,6 +6,8 @@ a Starlette route with caching headers.
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -17,10 +19,13 @@ from adapter.agent_card_builder import build_agent_card
 from adapter.agent_card_signer import ensure_keys, create_signer
 from adapter.profile_discovery import discover_profiles
 
+logger = logging.getLogger(__name__)
+
 
 def create_agent_card_route(
     profiles_dir: str | Path,
     *,
+    signing_profile: Optional[str] = None,
     node_name: str = "hermes-node",
     node_description: str = "Hermes Agent node",
     node_version: str = "1.0.0",
@@ -44,6 +49,8 @@ def create_agent_card_route(
     Args:
         profiles_dir: Path to the Hermes profiles directory
             (e.g. ``~/.hermes/profiles``).
+        signing_profile: Optional profile name to use for the signing key.
+            If None, uses the first profile directory found.
         node_name: Name of this node.
         node_description: Description of the node.
         node_version: Semantic version of the Agent Card.
@@ -82,27 +89,84 @@ def create_agent_card_route(
             push_notifications=push_notifications,
         )
 
-        # Sign the card — we use the first profile dir's signing key.
-        # In a multi-key setup, this would be a separate keystore lookup.
-        # For now, use the first profile found, or fall back to no signature.
+        # Sign the card using the configured (or first) profile's signing key.
+        # Snapshot os.environ to isolate ensure_keys() pollution — the signer's
+        # _load_env_file writes every variable from the profile's .env into the
+        # global process environment, which can leak secrets across profiles.
+        _saved_env = dict(os.environ)
+        signed = False
+        signing_reason = ""
+
         try:
-            first_profile = next(p for p in profiles_path.iterdir() if p.is_dir())
-            private_pem, _ = ensure_keys(first_profile)
-            signer = create_signer(private_pem)
-            card = signer(card)
-        except (StopIteration, FileNotFoundError, Exception):
-            # No profiles, no signing key — serve unsigned (dev only)
-            pass
+            private_pem = _resolve_signing_key(
+                profiles_path, signing_profile,
+            )
+            if private_pem is not None:
+                signer = create_signer(private_pem)
+                card = signer(card)
+                signed = True
+                signing_reason = "signed"
+        except Exception:
+            logger.exception("Unexpected error signing agent card")
+            signing_reason = "signing error"
+        finally:
+            # Restore environment to prevent leakage of .env vars
+            os.environ.clear()
+            os.environ.update(_saved_env)
 
         # Serialize using protobuf field names
         payload = MessageToDict(card, preserving_proto_field_name=True)
+
+        signed_header = "true" if signed else f"false ({signing_reason})"
 
         return JSONResponse(
             content=payload,
             headers={
                 "Cache-Control": f"max-age={cache_max_age}",
                 "Content-Type": "application/json",
+                "X-Agent-Card-Signed": signed_header,
             },
         )
 
     return Route("/.well-known/agent-card.json", endpoint=_serve_agent_card)
+
+
+def _resolve_signing_key(
+    profiles_path: Path,
+    signing_profile: Optional[str],
+) -> Optional[str]:
+    """Resolve the PEM private key for signing from the configured profile.
+
+    Returns None (with logging) when no key is available instead of raising.
+    """
+    if signing_profile:
+        profile_dir = profiles_path / signing_profile
+        if not profile_dir.is_dir():
+            logger.warning(
+                "signing_profile '%s' not found under %s — serving unsigned",
+                signing_profile, profiles_path,
+            )
+            return None
+        try:
+            private_pem, _ = ensure_keys(profile_dir)
+            return private_pem
+        except FileNotFoundError:
+            logger.warning(
+                "No A2A_SIGNING_KEY in profile '%s' — serving unsigned",
+                signing_profile,
+            )
+            return None
+
+    # Fall back to first profile directory
+    try:
+        first_profile = next(p for p in profiles_path.iterdir() if p.is_dir())
+    except StopIteration:
+        logger.info("No profiles found — serving unsigned agent card")
+        return None
+
+    try:
+        private_pem, _ = ensure_keys(first_profile)
+        return private_pem
+    except FileNotFoundError:
+        logger.warning("No A2A_SIGNING_KEY in first profile — serving unsigned")
+        return None
