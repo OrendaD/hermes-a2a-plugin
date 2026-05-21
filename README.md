@@ -1,139 +1,292 @@
-# A2A Core — Hermes Plugin for Agent-to-Agent Protocol v1.0
+# A2A Plugin — Agent-to-Agent Mesh for Hermes
 
-Active production A2A Protocol v1.0 server as a Hermes plugin. Protocol-agnostic domain models with hexagonal adapter architecture.
+A Google A2A v1.0 protocol plugin for [Hermes Agent](https://hermes-agent.nousresearch.com). Enables a mesh of agent nodes — Hermes, OpenClaw, or any A2A-compliant implementation — to discover each other, route tasks by capability, and execute cross-node workflows with provenance tracking, audit logging, and rate limiting.
 
-## Quick Start
+Two audiences read this file. Both are served.
+
+- **Humans:** scan the sections below for what's possible, where the boundaries are, and how to get started.
+- **Agents:** read every line. A `first-run` test script verifies everything is wired correctly on your system.
+
+---
+
+## What This Enables
+
+Two or more agent nodes connected in a mesh. Each node runs an A2A server (this plugin). Peers are configured in YAML. When node A needs a capability it doesn't have locally, it sends a task to a peer that does. The peer executes, returns results. Provenance chains track which node originated which request.
+
+**Concrete example:**
+
+```
+Tesla (Hermes) ←→ Proteus (Hermes)
+                    ↑
+               Partner (OpenClaw)
+```
+
+Tesla sends a task to Proteus. Proteus routes it to a Partner specialist. The Partner specialist sees `source_node: "tesla"` in the provenance metadata. Everyone knows where the work came from.
+
+## Boundaries
+
+**In scope:**
+- Hermes plugin: register/unregister lifecycle, auto-loads with gateway
+- Bearer-token auth between peers
+- Agent Card discovery (signed or unsigned)
+- Task dispatch (SendMessage → execution → result)
+- Capability-based routing via FleetController
+- Audit logging (JSONL, 10MB rotation, 3 backups)
+- Rate limiting (per-peer, configurable, HTTP 429)
+- Provenance tracking (reference_task_ids, source_node metadata)
+- Peer reconnection (exponential backoff, automatic)
+- Env var config overrides (A2A_<KEY>)
+- Health monitoring (passive watchdog script)
+
+**Out of scope (deliberate, v1.0):**
+- gRPC binding (HTTP/JSON-RPC only)
+- OAuth2/OIDC auth (bearer tokens only)
+- Distributed tracing (OpenTelemetry)
+- Multi-region failover
+- Hardware security module
+
+## Success & Failure
+
+**Success looks like:**
+- `curl http://127.0.0.1:9090/health` → `{"status":"ok","service":"a2a-server"}`
+- Peer sends task → task executes → result returns with provenance metadata
+- Retry loop reconnects a peer that came online after our gateway
+- Rate-limited peer gets HTTP 429 with `Retry-After: 60`
+- Audit log at `~/.hermes/a2a_audit.jsonl` captures each transition
+
+**Failure looks like (all handled cleanly):**
+- Peer unreachable → `TaskResult(status="failed", error="Peer 'X' not connected")`
+- Rate limit exceeded → HTTP 429 with clear error body
+- Malformed request → JSON-RPC parse error (-32700)
+- Disk full → audit logger catches the I/O error, continues serving
+- Gateway restart → in-flight tasks recovered via task store
+
+---
+
+# Installation
+
+## Prerequisites
+
+- Hermes Agent v0.14+ installed and running
+- Python 3.11+
+- For peer mesh: Cloudflare Zero Trust or direct TCP connectivity between nodes
+
+## Install in Hermes Venv
 
 ```bash
 git clone https://github.com/OrendaD/a2a-plugin.git
 cd a2a-plugin
 
-# Install in Hermes venv
+# Install the plugin package and all dependencies into Hermes venv
 ~/.hermes/hermes-agent/venv/bin/pip install -e '.[all]'
 
-# Create plugin symlink
+# Symlink so Hermes discovers the plugin
 ln -sf $(pwd)/src/a2a_plugin ~/.hermes/plugins/a2a-server
+```
 
-# Add to config.yaml (see setup docs)
-# ...
+Dependencies are pulled from PyPI via the `pip install` command. The `[all]` extra installs:
+- `google-a2a` — Google's A2A SDK (protobuf, client, server types)
+- `starlette` — ASGI server framework
+- `httpx` — HTTP client for peer communication
+- `pyyaml` — YAML config parsing
+- `cryptography` — Agent Card signing (ES256)
 
-# Restart gateway
+## Add to Config
+
+```yaml
+# ~/.config/hermes/config.yaml
+hermes:
+  a2a:
+    port: 9090
+    bind: "127.0.0.1"
+    node_name: "my-node"
+    node_id: "my-node"
+    rate_limit: 60  # requests/min per peer; 0 = disabled
+    peers:
+      - name: "proteus"
+        url: "http://proteus.local:9090"
+        api_key: "${PROTEUS_API_KEY}"  # resolved from env at startup
+```
+
+## Restart Gateway
+
+```bash
 hermes gateway restart
 ```
 
-## Architecture
-
-Three strict layers with a **non-negotiable boundary** — `src/core/` has zero A2A SDK imports:
-
-```
-A2A SDK (Google v1.0.3)    — protocol framing, JSON-RPC, AgentCard types
-  ^ src/adapter/            — HermesExecutor, ProfileDiscovery, CardBuilder, CardSigner
-  ^ src/core/               — domain models, FleetController, Orchestrator
-```
-
-**Verify boundary:**
-```bash
-grep -r "from a2a" src/core/    # MUST return zero
-```
-
-## Where to Start (for Tesla)
-
-| Read first | What you'll learn |
-|------------|-------------------|
-| `docs/A2A-PLUGIN-HANDOFF-TO-TESLA.md` | Complete state: what works, what's broken, what's urgent |
-| `docs/founding/a2a-domain-contracts.md` | Original contract — the spec we're building to |
-| `docs/founding/a2a-core-scope-tesla.md` | What was scoped for you specifically |
-| `docs/founding/a2a-plugin-architecture.md` | Hexagonal architecture, SSRF, auth design |
-| `docs/founding/a2a-orchestration-patterns.md` | FC vs Orchestrator, specialist recruitment |
-
-## Repo Structure
-
-```
-a2a-plugin/
-  src/
-    a2a_plugin/          # Plugin entry point — register() wires everything
-      __init__.py        # 319 lines — full integration (dispatch, FC, server)
-      plugin.yaml        # Hermes plugin manifest
-    adapter/             # A2A SDK integration layer
-      hermes_executor.py      # AgentExecutor implementation (733 lines)
-      agent_card_builder.py   # Capabilities → AgentCard protobuf
-      agent_card_route.py     # Starlette route for /.well-known/agent-card.json
-      agent_card_signer.py    # ES256 key generation, signing, verification
-      profile_discovery.py    # Scans profile config.yaml for a2a: sections
-    core/                # Domain layer — zero A2A imports
-      fleet_controller.py     # Routing engine (244 lines)
-      orchestrator.py         # Stateful flow management (257 lines, NOT YET WIRED)
-      domain/models/          # TaskIntent, TaskResult, AgentCapability, etc.
-      domain/interfaces/      # A2AAdapter, FleetController, Orchestrator ABCs
-  tests/
-    core/                 # 71 tests — dataclasses, FC routing, Orchestrator, interfaces
-    adapter/              # 106 tests — builder, signer, executor, profile discovery, wiring
-  scripts/
-    start-server.py       # Standalone server (mock dispatch until gateway restart)
-  docs/
-    founding/             # Founding contract documents (Tesla's original scope docs)
-    wiki-exports/         # Exported Hermes Wiki pages for offline reference
-    skill-refs/           # Hermes skill reference files for A2A integration
-    decisions/            # ADR-001: signing algorithm & key storage
-    research/             # Milestone 0 blockers research
-    SETUP-FOR-PROTEUS.md  # Cross-node test setup instructions
-    A2A-PLUGIN-HANDOFF-TO-TESLA.md  # Original handoff (state as of handover, not current)
-  setup.sh               # Environment bootstrap
-```
-
-## Test Suite
+Verify the A2A server is live:
 
 ```bash
-# All tests (254)
+curl http://127.0.0.1:9090/health
+# → {"status":"ok","service":"a2a-server"}
+```
+
+## First-Run Test
+
+After installation, run the first-run test to verify everything is wired correctly:
+
+```bash
+# Run the integration test suite (real HTTP through middleware stack)
+cd ~/src/a2a-core
+python -m pytest tests/integration/ -q --tb=short
+
+# Expected output: 22 passed in ~4s
+
+# Full test suite (366 tests, all layers)
+python -m pytest tests/ -q --tb=short
+```
+
+An agent can check the exit code (`0` = pass) and parse the output for `"passed"`.
+
+---
+
+# Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│              Hermes Gateway                  │
+│  ┌──────────────────────────────────────┐   │
+│  │  A2A Plugin (a2a_plugin/__init__.py) │   │
+│  │  ┌──────────┐  ┌────────────────┐   │   │
+│  │  │ Starlette │  │ RateLimit      │   │   │
+│  │  │ App      │──│ Middleware     │   │   │
+│  │  └────┬─────┘  └───────┬────────┘   │   │
+│  │       │                 │            │   │
+│  │  ┌────▼─────────────────▼──────┐    │   │
+│  │  │   A2A Handler (JSON-RPC)    │    │   │
+│  │  └────┬────────────────────────┘    │   │
+│  │       │                             │   │
+│  │  ┌────▼────────────────────────┐   │   │
+│  │  │   HermesExecutor            │   │   │
+│  │  │   · request_to_intent()     │   │   │
+│  │  │   · execute(AI session)     │   │   │
+│  │  │   · audit logging           │   │   │
+│  │  └────┬───────────┬───────────┘   │   │
+│  │       │           │               │   │
+│  │  ┌────▼───┐  ┌────▼──────┐      │   │
+│  │  │  Fleet │  │  Mesh     │      │   │
+│  │  │Control │  │  Peer    │      │   │
+│  │  │  ler   │  │  Client  │      │   │
+│  │  └───┬────┘  └────┬──────┘      │   │
+│  │      │            │             │   │
+│  │  ┌───▼────┐  ┌────▼──────┐    │   │
+│  │  │ Profile│  │ Retry     │    │   │
+│  │  │ Discov │  │ Loop     │    │   │
+│  │  └────────┘  └──────────┘    │   │
+│  └──────────────────────────────┘   │
+└─────────────────────────────────────┘
+            │  A2A JSON-RPC / HTTP
+            ▼
+       ┌──────────┐
+       │  Peers   │
+       │ (Proteus,│
+       │ Partner) │
+       └──────────┘
+```
+
+## Middleware Stack (order matters)
+
+Requests arrive at the ASGI app and pass through each middleware in sequence:
+
+1. **`A2AVersionMiddleware`** — validates the `A2A-Version` header. Rejects non-1.0 requests before they reach the handler.
+2. **`RateLimitMiddleware`** — checks per-peer rate limit. Returns HTTP 429 with `Retry-After` if exceeded.
+3. **Handler** — dispatches to `HermesExecutor` for A2A task execution.
+
+## Strict Layer Boundary
+
+`src/core/` has zero A2A SDK imports — the domain layer is protocol-agnostic. Verify:
+
+```bash
+grep -r "from a2a" src/core/   # MUST return zero
+```
+
+---
+
+# Configuration
+
+All config keys live under `a2a:` in the Hermes config YAML. Environment variables override at runtime.
+
+## Config Reference
+
+| Key | Type | Default | Env Override | Description |
+|-----|------|---------|-------------|-------------|
+| `port` | int | 9696 | `A2A_PORT` | A2A server listen port |
+| `bind` | str | `"127.0.0.1"` | `A2A_BIND` | Listen address (`"0.0.0.0"` for public) |
+| `node_name` | str | `"hermes-a2a-node"` | `A2A_NODE_NAME` | Human-readable node name (Agent Card) |
+| `node_id` | str | `"local"` | `A2A_NODE_ID` | Provenance identity (seen by peers) |
+| `profiles_dir` | str | `"~/.hermes/profiles"` | `A2A_PROFILES_DIR` | Profile discovery directory |
+| `signing_profile` | str | null | `A2A_SIGNING_PROFILE` | Profile name for Agent Card signing |
+| `rate_limit` | int | 0 (disabled) | `A2A_RATE_LIMIT` | Requests/minute per peer token |
+| `peers` | list | [] | `A2A_PEERS` (JSON) | Peer definitions (name, url, api_key) |
+
+## Peer Configuration
+
+Each peer requires three fields:
+
+```yaml
+a2a:
+  peers:
+    - name: "proteus"                    # Used in routing logs and errors
+      url: "http://proteus.local:9090"   # Peer's A2A server URL
+      api_key: "${PROTEUS_API_KEY}"      # Bearer token (supports ${VAR} syntax)
+```
+
+API keys support `${ENV_VAR}` resolution — values are resolved from the environment at startup, keeping keys out of config files checked into git.
+
+## Env Var Override Rules
+
+- `A2A_<KEY>` matches the config key name uppercased
+- Type coercion: int (int(val)), str (as-is), list (JSON parse), bool (1/true/yes)
+- Env var wins over YAML when both are set
+- Unknown `A2A_<KEY>` values are silently ignored
+- Supported keys: `port`, `bind`, `node_name`, `node_id`, `profiles_dir`, `signing_profile`, `rate_limit`, `peers`
+
+---
+
+# Running the Tests
+
+```bash
+# Full suite (366 tests)
 python -m pytest tests/ -q
 
 # By layer
-python -m pytest tests/core/ -q    # 71 tests — < 0.2s
-python -m pytest tests/adapter/ -q # 183+ tests — < 3s
+python -m pytest tests/core/ -q          # Domain models, FC routing, orchestrator
+python -m pytest tests/adapter/ -q       # Executor, auth, audit, mesh client, signing
+python -m pytest tests/plugin/ -q        # Plugin config, env var parsing
+python -m pytest tests/integration/ -q   # Real HTTP through middleware stack
+
+# Integration tests require no running gateway — Starlette TestClient
 ```
 
-## Gateway Integration
+---
 
-The plugin auto-loads when Hermes gateway starts:
+# Mesh Health
+
+A passive watchdog script checks three things:
 
 ```bash
-hermes gateway restart    # plugin auto-loads with real dispatch
+python scripts/mesh-watchdog.py
+# ✅ A2A watchdog — all clear
+#   ✅  /health: 200 OK
+#   ✅  configured peers: 2 (proteus, partner)
+#   ✅  disk (~/.hermes): 8GB free
 ```
 
-Until gateway restart, the standalone server (`scripts/start-server.py`) returns mock responses. See the handoff doc for the handover sequence.
+Deploy as a cron job to get regular health reports. The script is stateless per-tick — it never restarts anything.
 
-## Running Server
+---
 
-| Mode | Dispatch | Port | Lifecycle |
-|------|----------|------|-----------|
-| Standalone (`scripts/start-server.py`) | Mock placeholder | 9696 | Manual kill/restart |
-| Plugin (after `hermes gateway restart`) | Real `delegate_task` | 9696 | Tied to gateway process |
+# Companion Skills
 
-Verify server is live:
+For both humans and agents working with this plugin:
 
-```bash
-curl http://127.0.0.1:9696/.well-known/agent-card.json
-curl -X POST http://127.0.0.1:9696/a2a/jsonrpc \
-  -H 'Content-Type: application/json' \
-  -H 'A2A-Version: 1.0' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"message_id":"t1","role":"ROLE_USER","parts":[{"text":"ping"}]}}}'
-```
+- **`a2a-peer-setup`** — Step-by-step guide for configuring a new peer connection: generate API key, add to config, restart gateway, verify connectivity.
+- **`a2a-troubleshooting`** — Common failure modes and resolution paths for rate limit, peer offline, provenance, and config issues.
 
-## Key Gaps to Close
+Skills load via: `hermes skill load a2a-peer-setup`
 
-All foundational pieces are in place. Remaining work per delivery plan:
+---
 
-| Priority | Gap | Effort |
-|----------|-----|--------|
-| P0 | Cross-node dispatch test (Tesla ↔ Proteus) | 1 session |
-| P1 | Wire Orchestrator + SQLite persistence | 2-3 days |
-| P1 | Streaming (SSE) | 2-3 days |
-| P2 | Audit logging | 1 day |
-| P2 | Auth enforcement | 4 hours |
-| P3 | Rate limiting, provenance, hardening | 2-3 days |
+# License
 
-Full details: `docs/A2A-PLUGIN-HANDOFF-TO-TESLA.md`
-
-## License
-
-Apache 2.0 (matching A2A SDK license)
+Apache 2.0 (matching the A2A SDK license)
