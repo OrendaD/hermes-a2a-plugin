@@ -422,3 +422,190 @@ async def _async_iter(items):
     """Convert a list into an async iterator."""
     for item in items:
         yield item
+
+
+# ------------------------------------------------------------------
+# Retry loop
+# ------------------------------------------------------------------
+
+
+class TestRetryLoop:
+    """Tests for the automatic peer reconnection retry loop."""
+
+    async def test_connect_all_schedules_retry_for_failed_peer(
+        self, registry: PeerRegistry, fc: FleetController,
+    ):
+        """A peer that fails during connect_all gets a background retry task."""
+        mock_task = MagicMock()
+        mock_task.cancel = MagicMock()
+        mock_task.add_done_callback = MagicMock()
+
+        def _mock_create_task(coro):
+            """Consume the coroutine to avoid 'never awaited' RuntimeWarning."""
+            import asyncio
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return mock_task
+
+        with patch(
+            "adapter.mesh_peer_client.asyncio.create_task",
+            side_effect=_mock_create_task,
+        ), patch(
+            "adapter.mesh_peer_client.MeshPeerClient.connect_peer",
+            return_value=False,
+        ):
+            client = MeshPeerClient(registry, fc)
+            await client.connect_all()
+
+            # Should schedule a retry for each peer (both alpha and beta failed)
+            assert "alpha" in client._retry_tasks
+            assert "beta" in client._retry_tasks
+            assert client._retry_tasks["alpha"] is mock_task
+            assert client._retry_tasks["beta"] is mock_task
+
+    async def test_connect_all_does_not_schedule_retry_for_successful_peer(
+        self, registry: PeerRegistry, fc: FleetController,
+    ):
+        """Peers that connect successfully do NOT get retry tasks."""
+        with patch(
+            "adapter.mesh_peer_client.A2ACardResolver"
+        ) as mock_resolver_cls, patch(
+            "adapter.mesh_peer_client.ClientFactory"
+        ) as mock_factory_cls:
+            mock_resolver = AsyncMock()
+            mock_resolver.get_agent_card = AsyncMock(
+                return_value=AgentCard(
+                    name="node", description="node", version="1.0.0",
+                    default_input_modes=["text"], default_output_modes=["text"],
+                ),
+            )
+            mock_resolver_cls.return_value = mock_resolver
+            mock_client = AsyncMock()
+            mock_factory_cls.return_value.create.return_value = mock_client
+
+            client = MeshPeerClient(registry, fc)
+            await client.connect_all()
+
+            assert len(client._retry_tasks) == 0
+
+    async def test_retry_loop_reconnects_on_success(
+        self, registry: PeerRegistry, fc: FleetController, mock_agent_card: AgentCard,
+    ):
+        """Retry loop calls connect_peer in a loop and stops on success."""
+        connect_responses = iter([False, True])
+
+        async def mock_connect(name):
+            return next(connect_responses)
+
+        with patch(
+            "adapter.mesh_peer_client.asyncio.sleep",
+            return_value=None,
+        ):
+            client = MeshPeerClient(registry, fc)
+            client.connect_peer = mock_connect
+
+            # Fake a retry task entry so _retry_peer_loop can pop it
+            task_mock = MagicMock()
+            client._retry_tasks["alpha"] = task_mock
+
+            await client._retry_peer_loop("alpha")
+
+            # Retry task should have been popped
+            assert "alpha" not in client._retry_tasks
+
+    async def test_retry_loop_continues_on_failure(
+        self, registry: PeerRegistry, fc: FleetController,
+    ):
+        """Retry loop keeps trying when connect_peer keeps failing."""
+        call_count = 0
+
+        async def mock_connect(name):
+            nonlocal call_count
+            call_count += 1
+            return False  # never succeeds
+
+        with patch(
+            "adapter.mesh_peer_client.asyncio.sleep",
+            return_value=None,
+        ) as mock_sleep:
+            client = MeshPeerClient(registry, fc)
+            client.connect_peer = mock_connect
+
+            # Run a limited number of iterations via a side effect
+            # that stops the loop after 3 calls
+            original_connect = client.connect_peer
+            call_count = 0
+
+            async def limited_connect(name):
+                nonlocal call_count
+                call_count += 1
+                if call_count >= 3:
+                    raise _StopLoop()
+                return False
+
+            client.connect_peer = limited_connect
+
+            with pytest.raises(_StopLoop):
+                await client._retry_peer_loop("alpha")
+
+            assert call_count == 3
+
+    async def test_close_cancels_all_retry_tasks(
+        self, registry: PeerRegistry, fc: FleetController,
+    ):
+        """Calling close() cancels all pending retry tasks."""
+        with patch(
+            "adapter.mesh_peer_client.asyncio.create_task",
+        ) as mock_create_task:
+            mock_task_alpha = MagicMock()
+            mock_task_beta = MagicMock()
+            mock_create_task.side_effect = [mock_task_alpha, mock_task_beta]
+
+            client = MeshPeerClient(registry, fc)
+
+            # Manually schedule retries (as connect_all would)
+            client._retry_tasks["alpha"] = mock_task_alpha
+            client._retry_tasks["beta"] = mock_task_beta
+
+            await client.close()
+
+            mock_task_alpha.cancel.assert_called_once()
+            mock_task_beta.cancel.assert_called_once()
+            assert len(client._retry_tasks) == 0
+
+    async def test_multiple_failed_peers_get_independent_retries(
+        self, registry: PeerRegistry, fc: FleetController,
+    ):
+        """Each failed peer gets its own independent retry task."""
+        mock_task_alpha = MagicMock()
+        mock_task_beta = MagicMock()
+
+        def _mock_create_task_seq(coro):
+            import asyncio
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            # Return different tasks based on call order
+            if not hasattr(_mock_create_task_seq, 'call_idx'):
+                _mock_create_task_seq.call_idx = 0
+            tasks = [mock_task_alpha, mock_task_beta]
+            result = tasks[_mock_create_task_seq.call_idx]
+            _mock_create_task_seq.call_idx += 1
+            return result
+
+        with patch(
+            "adapter.mesh_peer_client.asyncio.create_task",
+            side_effect=_mock_create_task_seq,
+        ), patch(
+            "adapter.mesh_peer_client.MeshPeerClient.connect_peer",
+            return_value=False,
+        ):
+            client = MeshPeerClient(registry, fc)
+            await client.connect_all()
+
+            assert client._retry_tasks["alpha"] is mock_task_alpha
+            assert client._retry_tasks["beta"] is mock_task_beta
+
+
+class _StopLoop(Exception):
+    """Raised to stop an infinite retry loop during testing."""
+    pass

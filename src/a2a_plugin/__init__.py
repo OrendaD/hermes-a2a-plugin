@@ -37,12 +37,15 @@ from starlette.routing import Route
 from adapter.agent_card_builder import build_agent_card
 from adapter.agent_card_route import create_agent_card_route
 from adapter.auth_context_builder import BearerTokenContextBuilder
+from adapter.hermes_adapter import HermesA2AAdapter
 from adapter.hermes_executor import HermesExecutor
 from adapter.peer_registry import PeerConfig, PeerRegistry
 from adapter.profile_discovery import discover_profiles
+from adapter.rate_limit_middleware import RateLimitMiddleware
 from adapter.version_middleware import A2AVersionMiddleware
 from core.domain.models.result import TaskResult
 from core.fleet_controller import FleetControllerImpl
+from core.orchestrator import OrchestratorImpl
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +66,83 @@ DEFAULT_BIND = "127.0.0.1"
 DEFAULT_NODE_NAME = "hermes-a2a-node"
 DEFAULT_PROFILES_DIR = "~/.hermes/profiles"
 
+# Known config keys — used by the env-var override logic in
+# _read_a2a_config().  Each key maps to a type so A2A_<KEY> env vars
+# are properly coerced from string to the expected Python type.
+CONFIG_KEYS: dict[str, type] = {
+    "port": int,
+    "bind": str,
+    "node_name": str,
+    "node_id": str,
+    "profiles_dir": str,
+    "signing_profile": str,
+    "rate_limit": int,
+    "peers": list,
+}
+
+# Mapping from type → (coercer, boolish_set) for _coerce_env_value.
+# We keep this separate so the coercion logic can be unit-tested and
+# extended without touching CONFIG_KEYS.
+_BOOL_TRUE = frozenset({"1", "true", "yes"})
+
+
+def _coerce_env_value(key: str, raw: str, expected_type: type) -> Any:
+    """Parse a string from an environment variable into *expected_type*.
+
+    Supported types:
+      - ``int``  → ``int(raw)``; raises ``ValueError`` on junk.
+      - ``bool`` → ``raw.lower() in ("1", "true", "yes")``.
+      - ``str``  → ``raw`` as-is.
+      - ``list`` → ``json.loads(raw)`` (must be a JSON array).
+
+    Raises:
+        ValueError if the value cannot be coerced.
+    """
+    if expected_type is int:
+        try:
+            return int(raw)
+        except ValueError:
+            raise ValueError(
+                f"A2A_{key.upper()}={raw!r} is not a valid integer"
+            )
+
+    if expected_type is bool:
+        return raw.strip().lower() in _BOOL_TRUE
+
+    if expected_type is list:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"A2A_{key.upper()}={raw!r} is not valid JSON: {exc}"
+            )
+        if not isinstance(parsed, list):
+            raise ValueError(
+                f"A2A_{key.upper()}={raw!r} must be a JSON array"
+            )
+        return parsed
+
+    # str (default fallback)
+    return raw
+
 
 def _read_a2a_config() -> dict[str, Any]:
     """Read the ``a2a:`` section from ``~/.hermes/config.yaml``.
 
     Falls back to defaults for any missing key so the plugin works
     without explicit configuration.
+
+    Environment variable overrides (applied on top of YAML):
+
+        ``A2A_<KEY>`` — where ``<KEY>`` is any key in ``CONFIG_KEYS``
+        uppercased.  Values are coerced to the expected type:
+
+        * ``int`` keys (``port``, ``rate_limit``): ``int()``
+        * ``list`` keys (``peers``): ``json.loads()`` (must be array)
+        * ``str`` keys: taken as-is
+
+    Unknown env vars (``A2A_<KEY>`` where ``KEY`` is not in
+    ``CONFIG_KEYS``) are silently ignored.
     """
     try:
         from hermes_cli.config import load_config
@@ -79,7 +153,7 @@ def _read_a2a_config() -> dict[str, Any]:
         logger.warning("a2a-server: could not load Hermes config, using defaults")
         a2a = {}
 
-    return {
+    config = {
         "port": a2a.get("port", DEFAULT_PORT),
         "bind": a2a.get("bind", DEFAULT_BIND),
         "node_name": a2a.get("node_name", DEFAULT_NODE_NAME),
@@ -87,7 +161,16 @@ def _read_a2a_config() -> dict[str, Any]:
         "node_id": a2a.get("node_id", "local"),
         "signing_profile": a2a.get("signing_profile"),
         "peers": a2a.get("peers", []),
+        "rate_limit": a2a.get("rate_limit", 0),
     }
+
+    # Overlay environment variable overrides on top of the YAML baseline.
+    for key, expected_type in CONFIG_KEYS.items():
+        env_val = os.environ.get(f"A2A_{key.upper()}")
+        if env_val is not None:
+            config[key] = _coerce_env_value(key, env_val, expected_type)
+
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +219,10 @@ def _build_app(
 
     app = Starlette(routes=routes)
     app.add_middleware(A2AVersionMiddleware)
+    app.add_middleware(
+        RateLimitMiddleware,
+        rate_limit=config.get("rate_limit", 0),
+    )
     return app
 
 
@@ -354,6 +441,100 @@ def _schedule_peer_connections(mesh_client) -> None:
         )
 
 
+def _recover_tasks(orchestrator, task_store):
+    """Reconstruct conversation graphs and flag mid-flight tasks after restart.
+
+    Called at plugin startup after ``DatabaseTaskStore`` is initialized.
+    Iterates over stored SDK tasks, reconstructs the orchestrator's
+    in-memory conversation graphs, and flags any non-terminal tasks
+    for human review (``input_required`` with interruption message).
+
+    This is a best-effort recovery. Tasks with terminal states
+    (completed, failed, cancelled) are ignored — they are preserved
+    in the DB for history/audit but don't need graph reconstruction.
+
+    Args:
+        orchestrator: The ``OrchestratorImpl`` instance to register
+            recovered tasks with.
+        task_store: The ``DatabaseTaskStore`` instance to scan for
+            in-flight tasks.
+    """
+    import asyncio
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        logger.warning(
+            "a2a-server: no event loop for task recovery — deferring"
+        )
+        loop = None
+
+    if loop is None or not loop.is_running():
+        logger.info(
+            "a2a-server: event loop not running, skipping task recovery"
+        )
+        return
+
+    async def _scan():
+        try:
+            from a2a.types.a2a_pb2 import TaskState, ListTasksRequest
+            from a2a.server.context import ServerCallContext
+
+            # Build a minimal ListTasksRequest to retrieve tasks
+            params = ListTasksRequest()
+            context = ServerCallContext(state={})
+            page = await task_store.list(params, context)
+
+            recovered = 0
+            in_flight = 0
+            for stored_task in page.tasks:
+                recovered += 1
+                state = stored_task.status.state
+                # Check if this task is in a non-terminal, non-cancelled state
+                if state not in (
+                    TaskState.TASK_STATE_COMPLETED,
+                    TaskState.TASK_STATE_FAILED,
+                    TaskState.TASK_STATE_CANCELED,
+                ):
+                    in_flight += 1
+                    task_id = stored_task.id
+                    context_id = stored_task.context_id or task_id
+                    orchestrator.register_task(
+                        task_id=task_id,
+                        context_id=context_id,
+                    )
+                    # Flag for human review
+                    orchestrator.on_status_change(
+                        task_id,
+                        "input_required",
+                        TaskResult(
+                            status="input_required",
+                            data={
+                                "question": (
+                                    "Task was interrupted by gateway restart. "
+                                    "Please review the current state and "
+                                    "continue if appropriate."
+                                ),
+                            },
+                        ),
+                    )
+
+            logger.info(
+                "a2a-server: task recovery complete — %d task(s) scanned, "
+                "%d in-flight task(s) flagged for review",
+                recovered,
+                in_flight,
+            )
+        except Exception as exc:
+            logger.error(
+                "a2a-server: task recovery failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+    loop.create_task(_scan())
+
+
 def register(ctx) -> None:
     """Register the a2a-server plugin with Hermes.
 
@@ -471,7 +652,6 @@ def register(ctx) -> None:
     # ------------------------------------------------------------------
     from a2a.server.request_handlers import DefaultRequestHandlerV2
     from a2a.server.routes import create_jsonrpc_routes
-    from a2a.server.tasks import InMemoryTaskStore
 
     # Build AgentCard for the SDK handler from discovered profiles
     if caps:
@@ -494,13 +674,63 @@ def register(ctx) -> None:
             ),
         )
 
-    task_store = InMemoryTaskStore()
+    # ------------------------------------------------------------------
+    # DatabaseTaskStore — SQLite persistence (Phase 4)
+    # Replaces InMemoryTaskStore so tasks survive gateway restarts.
+    # ------------------------------------------------------------------
+    from a2a.server.tasks import DatabaseTaskStore
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    db_path = os.path.expanduser("~/.hermes/a2a_tasks.db")
+    db_dir = os.path.dirname(db_path)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+
+    db_url = f"sqlite+aiosqlite:///{db_path}"
+    db_engine = create_async_engine(db_url)
+    task_store = DatabaseTaskStore(engine=db_engine)
+    logger.info(
+        "a2a-server: using DatabaseTaskStore at %s",
+        db_path,
+    )
+
+    # ------------------------------------------------------------------
+    # AuditLogger — JSONL append-only audit trail (Phase 4)
+    # ------------------------------------------------------------------
+    from adapter.audit_logger import AuditLogger
+
+    audit_log_path = a2a_config.get("audit_log_path", "~/.hermes/a2a_audit.jsonl")
+    audit_logger = AuditLogger(log_path=audit_log_path)
+    logger.info("a2a-server: AuditLogger initialized at %s", audit_logger.log_path)
+
+    # ------------------------------------------------------------------
+    # Orchestration wiring (Phase 4)
+    # ------------------------------------------------------------------
+    adapter = HermesA2AAdapter(
+        dispatch_fn=_run_via_agent,
+        fc=fc,
+        mesh_client=mesh_client,
+    )
+    orchestrator = OrchestratorImpl(
+        fleet_controller=fc,
+        adapter=adapter,
+    )
 
     # NOTE: dispatch_fn is the module-level _run_via_agent (defined above),
     # which creates a fresh AIAgent directly instead of calling the
     # ctx.dispatch_tool("delegate_task", ...) path that fails outside an
     # active AIAgent session.
-    executor = HermesExecutor(dispatch_fn=_run_via_agent, fc=fc, mesh_client=mesh_client)
+    executor = HermesExecutor(
+        dispatch_fn=_run_via_agent,
+        fc=fc,
+        mesh_client=mesh_client,
+        orchestrator=orchestrator,
+        audit_logger=audit_logger,
+        node_id=node_id,
+    )
+
+    # Gateway restart recovery — flag in-flight tasks for review
+    _recover_tasks(orchestrator, task_store)
     handler = DefaultRequestHandlerV2(
         agent_executor=executor,
         task_store=task_store,

@@ -7,10 +7,14 @@ tasks to remote peers using SSRF-guarded transport with bearer-token auth.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 from typing import Optional
 
 import httpx
+
+from google.protobuf.struct_pb2 import Struct
 
 from a2a.client import (
     Client,
@@ -58,6 +62,7 @@ class MeshPeerClient:
         self._fc = fc
         self._clients: dict[str, Client] = {}
         self._cards: dict[str, AgentCard] = {}
+        self._retry_tasks: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -137,14 +142,71 @@ class MeshPeerClient:
         """Connect to every peer in the registry.
 
         Logs per-peer success/failure but does not raise — a peer that
-        is unreachable at startup will simply be unavailable for dispatch
-        until a retry or operator intervention.
+        is unreachable at startup will be retried in the background with
+        exponential backoff (full-jitter, 1s base, 60s cap) until it
+        reconnects or the client is closed.
         """
+        failed = []
         for peer in self._registry.all_peers():
-            await self.connect_peer(peer.name)
+            ok = await self.connect_peer(peer.name)
+            if not ok:
+                failed.append(peer.name)
+        # Schedule background retries for peers that failed
+        for name in failed:
+            self._schedule_peer_retry(name)
+
+    def _schedule_peer_retry(self, peer_name: str) -> None:
+        """Cancel any existing retry task for *peer_name*, start a new one."""
+        if peer_name in self._retry_tasks:
+            self._retry_tasks[peer_name].cancel()
+        self._retry_tasks[peer_name] = asyncio.create_task(
+            self._retry_peer_loop(peer_name),
+        )
+
+    async def _retry_peer_loop(
+        self, peer_name: str, max_interval: float = 60.0,
+    ) -> None:
+        """Background retry with exponential backoff + full jitter.
+
+        Base interval is 1s, doubling each attempt up to *max_interval*.
+        Each wait applies full jitter (random uniform from 0..delay) to
+        prevent thundering-herd patterns.  Stops as soon as
+        ``connect_peer()`` returns ``True``.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            # Exponential backoff: base=1s, cap=max_interval
+            delay = min(max_interval, 1.0 * (2**attempt))
+            # Full jitter (uniform from 0 to delay)
+            delay = random.uniform(0, delay)
+            await asyncio.sleep(delay)
+
+            ok = await self.connect_peer(peer_name)
+            if ok:
+                logger.info(
+                    "MeshPeerClient: reconnected peer '%s' after %d attempts",
+                    peer_name,
+                    attempt,
+                )
+                self._retry_tasks.pop(peer_name, None)
+                return
+            else:
+                logger.debug(
+                    "MeshPeerClient: retry %d for peer '%s' failed, "
+                    "next attempt in ~%.0fs",
+                    attempt,
+                    peer_name,
+                    delay,
+                )
 
     async def close(self) -> None:
         """Close all peer connections and release resources."""
+        # Cancel all background retry tasks
+        for name, task in list(self._retry_tasks.items()):
+            task.cancel()
+        self._retry_tasks.clear()
+
         for name, client in self._clients.items():
             try:
                 await client.close()
@@ -196,6 +258,20 @@ class MeshPeerClient:
                 parts=[Part(text=question)],
             ),
         )
+
+        # Propagate A2A protocol provenance fields from the intent
+        if intent.reference_task_ids:
+            req.message.reference_task_ids.extend(intent.reference_task_ids)
+        if intent.context_id:
+            req.message.context_id = intent.context_id
+        # Build provenance metadata (Struct) with source_node/source_profile
+        meta = Struct()
+        if intent.source_node and intent.source_node != "local":
+            meta.fields["source_node"].string_value = intent.source_node
+        if intent.source_profile and intent.source_profile != "a2a-adapter":
+            meta.fields["source_profile"].string_value = intent.source_profile
+        if meta.fields:
+            req.message.metadata.CopyFrom(meta)
 
         # ClientCallContext with bearer-token auth for the remote peer.
         # The A2A SDK's JSON-RPC transport reads service_parameters and
