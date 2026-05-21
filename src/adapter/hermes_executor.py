@@ -7,8 +7,11 @@ Fleet Controller at construction time.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 from a2a.server.agent_execution.agent_executor import AgentExecutor
 from a2a.server.agent_execution.context import RequestContext
@@ -48,6 +51,10 @@ class HermesExecutor(AgentExecutor):
     starting with ``\"a2a://\"``), the executor delegates to an optional
     ``MeshPeerClient`` instead of calling the local dispatch function.
 
+    When an ``orchestrator`` is provided, ``input_required`` results
+    trigger the orchestrator to recruit a specialist sub-agent, compose
+    the answer, and resume the blocked task.
+
     Args:
         dispatch_fn: A callable that accepts ``(goal, profile)`` and
             returns a ``TaskResult``. The plugin wires this to
@@ -57,6 +64,9 @@ class HermesExecutor(AgentExecutor):
         mesh_client: Optional ``MeshPeerClient`` for dispatching tasks
             to remote mesh peers. If ``None``, remote endpoints are
             treated as failures.
+        orchestrator: Optional ``OrchestratorImpl`` for handling
+            ``input_required`` status transitions by recruiting
+            specialist sub-agents and resuming blocked tasks.
     """
 
     def __init__(
@@ -64,14 +74,40 @@ class HermesExecutor(AgentExecutor):
         dispatch_fn: DispatchFn,
         fc: FleetController,
         mesh_client: Any = None,
+        orchestrator: Any = None,
+        audit_logger: Any = None,
+        node_id: str = "local",
+        node_profile: str = "a2a-adapter",
     ) -> None:
         self._dispatch = dispatch_fn
         self._fc = fc
         self._mesh_client = mesh_client
+        self._orchestrator = orchestrator
+        self._audit_logger = audit_logger
+        self._node_id = node_id
+        self._node_profile = node_profile
 
     # ------------------------------------------------------------------
     # AgentExecutor contract
     # ------------------------------------------------------------------
+
+    def _safe_log(self, event: str, **extra: Any) -> None:
+        """Log an audit event, swallowing I/O errors.
+
+        Prevents a disk-full or permissions error on the audit log from
+        crashing the A2A handler. All ``audit_logger.log_event()`` calls
+        go through this helper.
+
+        Args:
+            event: Event type name (e.g. ``"task_completed"``).
+            **extra: Event-specific fields forwarded to the logger.
+        """
+        if not self._audit_logger:
+            return
+        try:
+            self._audit_logger.log_event(event, **extra)
+        except Exception:
+            logger.exception("audit: failed to log event '%s'", event)
 
     async def execute(
         self, context: RequestContext, event_queue: EventQueue
@@ -111,12 +147,31 @@ class HermesExecutor(AgentExecutor):
                 role=Role.ROLE_AGENT,
                 parts=[Part(text=error_msg)],
             ))
+            # Audit: no route found
+            _tid = context.task_id or "unknown"
+            _cid = context.context_id or ""
+            self._safe_log("task_submitted", task_id=_tid, context_id=_cid)
+            self._safe_log(
+                "task_failed", task_id=_tid, context_id=_cid,
+                error=error_msg, reason="no_route",
+            )
             return
 
         # 4. Dispatch — remote or local?
         is_remote = dispatch.endpoint.startswith("a2a://")
         goal = intent.payload.get("question", "")
         profile = dispatch.profile_name
+        # Pre-compute task/context IDs for audit logging (needed before
+        # the result-handling section below).
+        _audit_tid = context.task_id or intent.context_id or "unknown"
+        _audit_cid = context.context_id or ""
+        self._safe_log("task_submitted", task_id=_audit_tid, context_id=_audit_cid)
+        self._safe_log(
+            "task_in_progress", task_id=_audit_tid, context_id=_audit_cid,
+            profile=profile, is_remote=is_remote,
+            source_node=intent.source_node,
+            source_profile=intent.source_profile,
+        )
         try:
             if is_remote:
                 # Remote dispatch via mesh peer client
@@ -136,17 +191,38 @@ class HermesExecutor(AgentExecutor):
                 role=Role.ROLE_AGENT,
                 parts=[Part(text=f"Execution error: {exc}")],
             ))
+            self._safe_log(
+                "task_failed", task_id=_audit_tid, context_id=_audit_cid,
+                error=str(exc),
+            )
             return
 
-        # 5. Emit result — message-only mode.
-        # The SDK supports two patterns:
-        #   - Message-only: emit a single Message, nothing else.
-        #     Handler returns it to the client immediately.
-        #   - Long-running task: emit Task (initial), then Message,
-        #     then TaskStatusUpdateEvent(COMPLETED).
-        # For our synchronous dispatch_fc pattern, message-only is
-        # simpler and avoids the "must enqueue Task before
-        # TaskStatusUpdateEvent" protocol requirement.
+        # 5. Handle result — status transitions + orchestration
+        task_id = context.task_id or intent.context_id or "unknown"
+        context_id = context.context_id or ""
+
+        if result.status == "input_required":
+            # Emit INPUT_REQUIRED status — no final Message
+            # The orchestrator will recruit a specialist and resume
+            await self.emit_status_event(
+                task_id, TaskState.TASK_STATE_INPUT_REQUIRED,
+                event_queue,
+            )
+            self._safe_log(
+                "task_in_progress", task_id=task_id, context_id=context_id,
+                status="input_required",
+            )
+            if self._orchestrator:
+                self._safe_log(
+                    "orchestrator_recruit", task_id=task_id, context_id=context_id,
+                    status="input_required",
+                )
+                self._orchestrator.on_status_change(
+                    task_id, "input_required", result,
+                )
+            return
+
+        # Emit terminal result — Message + status event
         if result.status == "completed":
             answer = ""
             if result.data and "answer" in result.data:
@@ -155,32 +231,49 @@ class HermesExecutor(AgentExecutor):
                 answer = str(result.data)
 
             if answer:
-                await event_queue.enqueue_event(Message(
-                    message_id=str(uuid.uuid4()),
-                    task_id=context.task_id,
-                    context_id=context.context_id or "",
-                    role=Role.ROLE_AGENT,
-                    parts=[Part(text=answer)],
-                ))
+                await self.emit_message(
+                    task_id, context_id,
+                    [Part(text=answer)],
+                    event_queue,
+                )
             else:
-                # No answer text but completed — still emit a message
-                await event_queue.enqueue_event(Message(
-                    message_id=str(uuid.uuid4()),
-                    task_id=context.task_id,
-                    context_id=context.context_id or "",
-                    role=Role.ROLE_AGENT,
-                    parts=[Part(text="Task completed.")],
-                ))
+                await self.emit_message(
+                    task_id, context_id,
+                    [Part(text="Task completed.")],
+                    event_queue,
+                )
+            self._safe_log(
+                "message_sent", task_id=task_id, context_id=context_id,
+                role="agent",
+            )
+            await self.emit_status_event(
+                task_id, TaskState.TASK_STATE_COMPLETED,
+                event_queue, final=True,
+            )
+            self._safe_log(
+                "task_completed", task_id=task_id, context_id=context_id,
+                status="completed",
+            )
         else:
-            # FAILED, CANCELLED, or INPUT_REQUIRED
+            # FAILED, CANCELLED, or unknown
             status_text = result.error or f"Status: {result.status}"
-            await event_queue.enqueue_event(Message(
-                message_id=str(uuid.uuid4()),
-                task_id=context.task_id,
-                context_id=context.context_id or "",
-                role=Role.ROLE_AGENT,
-                parts=[Part(text=status_text)],
-            ))
+            await self.emit_message(
+                task_id, context_id,
+                [Part(text=status_text)],
+                event_queue,
+            )
+            self._safe_log(
+                "message_sent", task_id=task_id, context_id=context_id,
+                role="agent",
+            )
+            await self.emit_status_event(
+                task_id, TaskState.TASK_STATE_FAILED,
+                event_queue, final=True,
+            )
+            self._safe_log(
+                "task_failed", task_id=task_id, context_id=context_id,
+                status=result.status, error=result.error or "",
+            )
 
     async def cancel(
         self, context: RequestContext, event_queue: EventQueue
@@ -214,6 +307,18 @@ class HermesExecutor(AgentExecutor):
             parts=[Part(text=f"Task {task_id} cancelled by user request.")],
         ))
 
+        # Notify orchestrator if wired
+        if self._orchestrator:
+            self._orchestrator.on_status_change(
+                task_id,
+                "cancelled",
+                TaskResult(status="cancelled", data={"message": "Cancelled by user request"}),
+            )
+
+        self._safe_log(
+            "task_cancelled", task_id=task_id, context_id=context_id,
+        )
+
     # ------------------------------------------------------------------
     # Translation helpers
     # ------------------------------------------------------------------
@@ -221,8 +326,8 @@ class HermesExecutor(AgentExecutor):
     def request_to_intent(
         self,
         request_context: RequestContext,
-        source_node: str = "local",
-        source_profile: str = "a2a-adapter",
+        source_node: str | None = None,
+        source_profile: str | None = None,
     ) -> TaskIntent:
         """Translate an A2A ``RequestContext`` into a ``TaskIntent``.
 
@@ -233,11 +338,15 @@ class HermesExecutor(AgentExecutor):
         Args:
             request_context: The SDK request context.
             source_node: Node ID of this Hermes instance.
+                Defaults to ``self._node_id``.
             source_profile: Profile name for the source field.
+                Defaults to ``self._node_profile``.
 
         Returns:
             A ``TaskIntent`` ready for Fleet Controller routing.
         """
+        source_node = source_node or self._node_id
+        source_profile = source_profile or self._node_profile
         message = request_context.message
         parts = list(message.parts) if message else []
 
@@ -341,7 +450,7 @@ class HermesExecutor(AgentExecutor):
 
         return a2a_task
 
-    def emit_status_event(
+    async def emit_status_event(
         self,
         task_id: str,
         state: TaskState.ValueType,
@@ -359,27 +468,13 @@ class HermesExecutor(AgentExecutor):
             event_queue: The SDK event queue.
             final: Whether this is the final event for this task.
         """
-        import asyncio
         update = TaskStatusUpdateEvent(
-            id=task_id,
+            task_id=task_id,
             status=TaskStatus(state=state),
-            final=final,
         )
-        # event_queue.enqueue is async — the caller (execute()) is
-        # responsible for calling this in an async context
-        try:
-            loop = asyncio.get_running_loop()
-            if loop.is_running():
-                asyncio.ensure_future(event_queue.enqueue(update))
-            else:
-                raise RuntimeError("No running event loop for event_queue.enqueue")
-        except RuntimeError:
-            raise RuntimeError(
-                "Cannot emit event: no running async event loop. "
-                "This should only be called from within execute()."
-            )
+        await event_queue.enqueue_event(update)
 
-    def emit_message(
+    async def emit_message(
         self,
         task_id: str,
         context_id: str,
@@ -396,7 +491,6 @@ class HermesExecutor(AgentExecutor):
             event_queue: The SDK event queue.
             role: The message role (default ``ROLE_AGENT``).
         """
-        import asyncio
         msg = Message(
             message_id=str(uuid.uuid4()),
             task_id=task_id,
@@ -404,17 +498,7 @@ class HermesExecutor(AgentExecutor):
             role=role,
             parts=parts,
         )
-        try:
-            loop = asyncio.get_running_loop()
-            if loop.is_running():
-                asyncio.ensure_future(event_queue.enqueue(msg))
-            else:
-                raise RuntimeError("No running event loop for event_queue.enqueue")
-        except RuntimeError:
-            raise RuntimeError(
-                "Cannot emit event: no running async event loop. "
-                "This should only be called from within execute()."
-            )
+        await event_queue.enqueue_event(msg)
 
 
 # ------------------------------------------------------------------

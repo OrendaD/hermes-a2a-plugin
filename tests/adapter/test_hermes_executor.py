@@ -554,15 +554,18 @@ class MockFC:
 
 
 class TestExecute:
-    """Full execute() pipeline tests — message-only mode.
+    """Full execute() pipeline tests — status transitions + messages.
 
-    The executor only emits Message events. No TaskStatusUpdateEvent.
-    The SDK handler returns the Message immediately to the client.
+    The executor now emits:
+    - ``TaskStatusUpdateEvent`` after the Message for terminal states
+      (COMPLETED / FAILED / CANCELED)
+    - ``TaskStatusUpdateEvent(INPUT_REQUIRED)`` without a Message
+      when the dispatch returns ``input_required``
     """
 
     @pytest.mark.asyncio
-    async def test_successful_dispatch_emits_message(self):
-        """A successful route + dispatch emits a Message with the answer."""
+    async def test_successful_dispatch_emits_message_and_status(self):
+        """A successful route + dispatch emits a Message and COMPLETED status."""
         fc = MockFC(dispatch=ProfileDispatch(
             task_id="t1",
             profile_name="sherlock",
@@ -582,8 +585,11 @@ class TestExecute:
 
         await executor.execute(ctx, eq)
 
-        assert len(eq.events) == 1
+        # Events: [Message, TaskStatusUpdateEvent(COMPLETED)]
+        assert len(eq.events) == 2
         assert isinstance(eq.events[0], Message)
+        assert isinstance(eq.events[1], TaskStatusUpdateEvent)
+        assert eq.events[1].status.state == TaskState.TASK_STATE_COMPLETED
 
     @pytest.mark.asyncio
     async def test_successful_message_contains_answer(self):
@@ -627,6 +633,7 @@ class TestExecute:
 
         await executor.execute(ctx, eq)
 
+        # No route → error Message only (no dispatch, no status event)
         assert len(eq.events) == 1
         msg = eq.events[0]
         assert isinstance(msg, Message)
@@ -655,8 +662,8 @@ class TestExecute:
         assert "Key not found" in (msg.parts[0].text if msg.parts else "")
 
     @pytest.mark.asyncio
-    async def test_failed_result_emits_error_message(self):
-        """When dispatch returns failed TaskResult, emit error Message."""
+    async def test_failed_result_emits_error_and_status(self):
+        """When dispatch returns failed TaskResult, emit error Message + FAILED status."""
         fc = MockFC(dispatch=ProfileDispatch(
             task_id="t5", profile_name="builder",
             node_address="local", endpoint="internal:profile",
@@ -674,10 +681,13 @@ class TestExecute:
 
         await executor.execute(ctx, eq)
 
-        assert len(eq.events) == 1
+        # Events: [Message(error), TaskStatusUpdateEvent(FAILED)]
+        assert len(eq.events) == 2
         msg = eq.events[0]
         assert isinstance(msg, Message)
         assert "Timeout" in (msg.parts[0].text if msg.parts else "")
+        assert isinstance(eq.events[1], TaskStatusUpdateEvent)
+        assert eq.events[1].status.state == TaskState.TASK_STATE_FAILED
 
     @pytest.mark.asyncio
     async def test_completed_without_answer_data_still_emits_message(self):
@@ -699,7 +709,7 @@ class TestExecute:
 
         await executor.execute(ctx, eq)
 
-        assert len(eq.events) == 1
+        assert len(eq.events) == 2
         assert isinstance(eq.events[0], Message)
         assert eq.events[0].parts[0].text == "Task completed."
 
@@ -731,3 +741,76 @@ class TestExecute:
         assert isinstance(msg, Message)
         assert msg.task_id == "task/execute-99"
         assert msg.context_id == "ctx-exec-test"
+
+    @pytest.mark.asyncio
+    async def test_input_required_emits_status_and_calls_orchestrator(self):
+        """When dispatch returns input_required, emit INPUT_REQUIRED status
+        and call orchestrator.on_status_change(). No Message is emitted."""
+        fc = MockFC(dispatch=ProfileDispatch(
+            task_id="t8", profile_name="sherlock",
+            node_address="local", endpoint="internal:profile",
+            status="dispatched",
+        ))
+        orchestrator_calls = []
+
+        class MockOrchestrator:
+            def on_status_change(self, task_id, new_state, task_result):
+                orchestrator_calls.append((task_id, new_state, task_result))
+            def register_task(self, *args, **kwargs):
+                pass
+
+        executor = HermesExecutor(
+            dispatch_fn=lambda goal, profile: TaskResult(
+                status="input_required",
+                data={"question": "Which port?"},
+            ),
+            fc=fc,
+            orchestrator=MockOrchestrator(),
+        )
+        ctx = make_context(
+            parts_dicts=[{"text": "Deploy on which port?"}],
+            task_id="task/input-req-1",
+        )
+        eq = MockEventQueue()
+
+        await executor.execute(ctx, eq)
+
+        # Only a TaskStatusUpdateEvent(INPUT_REQUIRED), no Message
+        assert len(eq.events) == 1
+        assert isinstance(eq.events[0], TaskStatusUpdateEvent)
+        assert eq.events[0].status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+
+        # Orchestrator was called
+        assert len(orchestrator_calls) == 1
+        call_task_id, call_state, call_result = orchestrator_calls[0]
+        assert call_task_id == "task/input-req-1"
+        assert call_state == "input_required"
+        assert call_result.data.get("question") == "Which port?"
+
+    @pytest.mark.asyncio
+    async def test_input_required_without_orchestrator_emits_status(self):
+        """Without an orchestrator, input_required still emits INPUT_REQUIRED status."""
+        fc = MockFC(dispatch=ProfileDispatch(
+            task_id="t9", profile_name="sherlock",
+            node_address="local", endpoint="internal:profile",
+            status="dispatched",
+        ))
+        executor = HermesExecutor(
+            dispatch_fn=lambda goal, profile: TaskResult(
+                status="input_required",
+                data={"question": "Which database?"},
+            ),
+            fc=fc,
+            # No orchestrator
+        )
+        ctx = make_context(
+            parts_dicts=[{"text": "Which DB?"}],
+            task_id="task/input-req-2",
+        )
+        eq = MockEventQueue()
+
+        await executor.execute(ctx, eq)
+
+        assert len(eq.events) == 1
+        assert isinstance(eq.events[0], TaskStatusUpdateEvent)
+        assert eq.events[0].status.state == TaskState.TASK_STATE_INPUT_REQUIRED
