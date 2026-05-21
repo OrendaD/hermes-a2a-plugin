@@ -260,9 +260,9 @@ python -m pytest tests/integration/ -q   # Real HTTP through middleware stack
 
 ---
 
-# Mesh Health
+## Mesh Health
 
-A passive watchdog script checks three things:
+A passive health check script verifies the server is running and responsive:
 
 ```bash
 python scripts/mesh-watchdog.py
@@ -272,18 +272,19 @@ python scripts/mesh-watchdog.py
 #   ✅  disk (~/.hermes): 8GB free
 ```
 
-Deploy as a cron job to get regular health reports. The script is stateless per-tick — it never restarts anything.
+The script is stateless per-tick — it checks, reports, exits. No modifications to the running system.
 
 ---
 
-# Companion Skills
+## Repo Docs
 
-For both humans and agents working with this plugin:
-
-- **`a2a-peer-setup`** — Step-by-step guide for configuring a new peer connection: generate API key, add to config, restart gateway, verify connectivity.
-- **`a2a-troubleshooting`** — Common failure modes and resolution paths for rate limit, peer offline, provenance, and config issues.
-
-Skills load via: `hermes skill load a2a-peer-setup`
+| Path | Audience | Content |
+|------|----------|---------|
+| `docs/guides/a2a-peer-setup.md` | Operators | Step-by-step peer enrollment |
+| `docs/guides/a2a-plugin-runbook.md` | Operators | Plugin lifecycle and usage |
+| `docs/references/a2a-external-surface.md` | Agents/Operators | A2A endpoint surface |
+| `docs/references/a2a-intent-schemas.md` | Agents/Operators | Intent payload schemas |
+| `docs/decisions/adr-001-signing.md` | Developers | Agent Card signing rationale |
 
 ---
 
