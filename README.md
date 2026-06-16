@@ -4,6 +4,8 @@ A Google A2A v1.0 protocol plugin for [Hermes Agent](https://hermes-agent.nousre
 
 **New to A2A?** Start with the [User Manual](docs/USER-MANUAL.md) — it walks through installation, first task, peer setup, and troubleshooting. The manual covers six networking options: direct TCP, reverse proxy, Cloudflare WARP, Tailscale/Headscale, NetBird, and WireGuard.
 
+> **Disclaimer:** This plugin is presented as-is. It was built for a specific setup and works — but it is not actively maintained. Clone it, fork it, and hack it to fit your needs. If you find bugs or improve it, contributions via PR are welcome but response times are not guaranteed.
+
 ---
 
 ## What This Enables
