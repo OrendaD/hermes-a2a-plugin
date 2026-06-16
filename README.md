@@ -291,7 +291,6 @@ The script is stateless per-tick — it checks, reports, exits. No modifications
 | `docs/guides/a2a-plugin-runbook.md` | Operators | Plugin lifecycle and usage |
 
 ---
-
 # Troubleshooting
 
 If something isn't working, check the [Troubleshooting Guide](docs/references/troubleshooting.md) — it covers 20 common failure scenarios with symptom→cause→fix tables.
@@ -313,7 +312,6 @@ curl http://127.0.0.1:9696/.well-known/agent-card.json | python3 -m json.tool
 ```
 
 ---
-
 # Getting Help
 
 - **Issues:** [GitHub Issues](https://github.com/OrendaD/hermes-a2a-plugin/issues)
@@ -321,13 +319,11 @@ curl http://127.0.0.1:9696/.well-known/agent-card.json | python3 -m json.tool
 - **Hermes Agent:** [Documentation](https://hermes-agent.nousresearch.com/docs) | [GitHub](https://github.com/NousResearch/hermes-agent)
 
 ---
-
 # License
 
 Apache 2.0 (matching the A2A SDK license)
 
 ---
-
 # Acknowledgments
 
 This plugin builds on the work of [iamagenius00/hermes-a2a-preview](https://github.com/iamagenius00/hermes-a2a-preview), the first A2A protocol implementation for Hermes Agent. That project demonstrated the feasibility of A2A-over-Hermes, validated the SSRF protection model, and established the friend-based auth pattern. The v1.0 plugin in this repository is a ground-up rewrite with a different architecture (hexagonal, protocol-agnostic core) but owes its existence to that proof of concept.
