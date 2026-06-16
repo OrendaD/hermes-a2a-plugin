@@ -48,7 +48,7 @@ Tesla sends a task to Proteus. Proteus routes it to a Partner specialist. The Pa
 ## Success & Failure
 
 **Success looks like:**
-- `curl http://127.0.0.1:9090/health` → `{"status":"ok","service":"a2a-server"}`
+- `curl http://127.0.0.1:9696/health` → `{"status":"ok","service":"a2a-server"}`
 - Peer sends task → task executes → result returns with provenance metadata
 - Retry loop reconnects a peer that came online after our gateway
 - Rate-limited peer gets HTTP 429 with `Retry-After: 60`
@@ -69,13 +69,13 @@ Tesla sends a task to Proteus. Proteus routes it to a Partner specialist. The Pa
 
 - Hermes Agent v0.14+ installed and running
 - Python 3.11+
-- For peer mesh: Cloudflare Zero Trust or direct TCP connectivity between nodes
+- For peer mesh: any TCP connectivity between nodes (direct, VPN, tunnel, or reverse proxy)
 
 ## Install in Hermes Venv
 
 ```bash
-git clone https://github.com/OrendaD/a2a-plugin.git
-cd a2a-plugin
+git clone https://github.com/OrendaD/hermes-a2a-plugin.git
+cd hermes-a2a-plugin
 
 # Install the plugin package and all dependencies into Hermes venv
 ~/.hermes/hermes-agent/venv/bin/pip install -e '.[all]'
@@ -85,8 +85,8 @@ ln -sf $(pwd)/src/a2a_plugin ~/.hermes/plugins/a2a-server
 ```
 
 Dependencies are pulled from PyPI via the `pip install` command. The `[all]` extra installs:
-- `google-a2a` — Google's A2A SDK (protobuf, client, server types)
-- `starlette` — ASGI server framework
+- `a2a-sdk` — Google's A2A SDK (protobuf, client, server types)
+- `starlette>=1.0.1` — ASGI server framework (CVE-2026-48710 patched)
 - `httpx` — HTTP client for peer communication
 - `pyyaml` — YAML config parsing
 - `cryptography` — Agent Card signing (ES256)
@@ -94,17 +94,17 @@ Dependencies are pulled from PyPI via the `pip install` command. The `[all]` ext
 ## Add to Config
 
 ```yaml
-# ~/.config/hermes/config.yaml
+# ~/.hermes/config.yaml
 hermes:
   a2a:
-    port: 9090
+    port: 9696
     bind: "127.0.0.1"
     node_name: "my-node"
     node_id: "my-node"
     rate_limit: 60  # requests/min per peer; 0 = disabled
     peers:
       - name: "proteus"
-        url: "http://proteus.local:9090"
+        url: "http://proteus.local:9696"
         api_key: "${PROTEUS_API_KEY}"  # resolved from env at startup
 ```
 
@@ -117,7 +117,7 @@ hermes gateway restart
 Verify the A2A server is live:
 
 ```bash
-curl http://127.0.0.1:9090/health
+curl http://127.0.0.1:9696/health
 # → {"status":"ok","service":"a2a-server"}
 ```
 
@@ -127,7 +127,6 @@ After installation, run the first-run test to verify everything is wired correct
 
 ```bash
 # Run the integration test suite (real HTTP through middleware stack)
-cd ~/src/a2a-core
 python -m pytest tests/integration/ -q --tb=short
 
 # Expected output: 22 passed in ~4s
@@ -227,7 +226,7 @@ Each peer requires three fields:
 a2a:
   peers:
     - name: "proteus"                    # Used in routing logs and errors
-      url: "http://proteus.local:9090"   # Peer's A2A server URL
+      url: "http://proteus.local:9696"   # Peer's A2A server URL
       api_key: "${PROTEUS_API_KEY}"      # Bearer token (supports ${VAR} syntax)
 ```
 
@@ -280,11 +279,17 @@ The script is stateless per-tick — it checks, reports, exits. No modifications
 
 | Path | Audience | Content |
 |------|----------|---------|
+| `docs/USER-MANUAL.md` | All | Complete user manual |
+| `docs/references/a2a-protocol-links.md` | All | Outbound links to spec, SDK, documentation |
+| `docs/references/a2a-spec-summary.md` | All | Condensed A2A v1.0 specification |
+| `docs/references/config-reference.md` | Operators | Full configuration reference |
+| `docs/references/intent-schemas.md` | Developers | Intent payload contracts |
+| `docs/references/troubleshooting.md` | Operators | Symptom→cause→fix matrix |
+| `docs/references/architecture.md` | Developers | Layer diagram and design decisions |
+| `docs/references/signing-adr.md` | Developers | Agent Card signing decision record |
+| `docs/references/partner-onboarding.md` | Operators | Adding peers to your mesh |
 | `docs/guides/a2a-peer-setup.md` | Operators | Step-by-step peer enrollment |
 | `docs/guides/a2a-plugin-runbook.md` | Operators | Plugin lifecycle and usage |
-| `docs/references/a2a-external-surface.md` | Agents/Operators | A2A endpoint surface |
-| `docs/references/a2a-intent-schemas.md` | Agents/Operators | Intent payload schemas |
-| `docs/decisions/adr-001-signing.md` | Developers | Agent Card signing rationale |
 
 ---
 

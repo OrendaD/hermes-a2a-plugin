@@ -65,7 +65,7 @@ The plugin is installed as a symlink:
 
 ```bash
 # Symlink from plugins dir to source
-ln -sf /home/freetea/src/a2a-core/src/a2a_plugin ~/.hermes/plugins/a2a-server
+ln -sf /path/to/a2a-plugin/src/a2a_plugin ~/.hermes/plugins/a2a-server
 
 # Enable in config.yaml (under plugins.enabled)
 ```
@@ -73,7 +73,7 @@ ln -sf /home/freetea/src/a2a-core/src/a2a_plugin ~/.hermes/plugins/a2a-server
 The pip package is installed as editable:
 
 ```bash
-cd ~/src/a2a-core && \
+cd /path/to/a2a-plugin && \
 ~/.hermes/hermes-agent/venv/bin/pip install -e '.[all]'
 ```
 
@@ -155,18 +155,15 @@ Then restart gateway.
 
 ### Profile not appearing in Agent Card
 - Verify `a2a:` section has `intents` with at least one value
-- Verify YAML is valid: `python3 -c "import yaml; yaml.safe_load(open('/home/freetea/.hermes/profiles/<name>/config.yaml'))"`
+- Verify YAML is valid: `python3 -c "import yaml; yaml.safe_load(open('~/.hermes/profiles/<name>/config.yaml'))"`
 - Restart gateway
 
 ## File Inventory
 
 | Path | Purpose |
 |------|---------|
-| `~/src/a2a-core/src/a2a_plugin/` | Plugin entry point (`register()`) |
-| `~/src/a2a-core/src/adapter/` | HermesExecutor, CardBuilder, CardSigner, ProfileDiscovery |
-| `~/src/a2a-core/src/core/` | Domain models, FleetController, Orchestrator (0 A2A imports) |
-| `~/src/a2a-core/tests/` | 177 tests (71 core, 106 adapter) |
-| `~/wiki-ops/planning/a2a-plugin-delivery-plan.md` | Full delivery plan with gates |
-| `docs/changes/2026-05-20-a2a-phase0-validation.md` | ✅ Found |
-| `docs/changes/2026-05-20-a2a-phase1-checkpoint.md` | ✅ Found |
-| `docs/changes/2026-05-20-a2a-phase1-complete.md` | ✅ Found |
+| `/path/to/a2a-plugin/src/a2a_plugin/` | Plugin entry point (`register()`) |
+| `/path/to/a2a-plugin/src/adapter/` | HermesExecutor, CardBuilder, CardSigner, ProfileDiscovery |
+| `/path/to/a2a-plugin/src/core/` | Domain models, FleetController, Orchestrator (0 A2A imports) |
+| `/path/to/a2a-plugin/tests/` | 366 tests (core, adapter, plugin, integration) |
+| `docs/USER-MANUAL.md` | Complete user manual |

@@ -190,6 +190,93 @@ peers:
     api_key: "${PEER_API_KEY}"
 ```
 
+### Option E: Tailscale / Headscale (mesh VPN)
+
+Tailscale (or its open-source self-hosted counterpart Headscale) creates a mesh VPN with automatic key management and NAT traversal. No firewall rules or port forwarding needed.
+
+```bash
+# Install Tailscale on both nodes
+# macOS: brew install tailscale
+# Linux: curl -fsSL https://tailscale.com/install.sh | sh
+
+# Start Tailscale
+tailscale up
+
+# Find your Tailscale IP
+tailscale ip -4
+# 100.x.x.x
+```
+
+```yaml
+peers:
+  - name: "tailscale-peer"
+    url: "http://100.x.x.x:9696"
+    api_key: "${PEER_API_KEY}"
+```
+
+**Headscale** is a self-hosted open-source implementation of the Tailscale control server. Same wireguard protocol, you manage the coordination server. Good for teams that want Tailscale's UX without the SaaS dependency.
+
+**Requirements:**
+- Tailscale installed on both nodes
+- Both nodes authenticated to the same Tailscale network (or Headscale instance)
+- No additional firewall config — Tailscale handles NAT traversal
+
+### Option F: NetBird (mesh VPN)
+
+NetBird is an open-source mesh VPN built on WireGuard with additional features: NAT traversal, relay fallback, and peer grouping. Similar to Tailscale but fully open-source with a self-hosted control plane option.
+
+```bash
+# Install NetBird on both nodes
+# macOS: brew install netbird
+# Linux: curl -fsSL https://install.netbird.io/install.sh | sh
+
+# Connect
+netbird up
+
+# Find your NetBird IP
+netbird status
+```
+
+```yaml
+peers:
+  - name: "netbird-peer"
+    url: "http://100.x.x.x:9696"
+    api_key: "${PEER_API_KEY}"
+```
+
+**Requirements:**
+- NetBird installed on both nodes
+- Both nodes connected to the same NetBird network
+- No additional firewall config
+
+### Option G: WireGuard (manual mesh)
+
+For full control, WireGuard provides a lightweight VPN tunnel. You manage keys and peer configuration manually.
+
+```ini
+# /etc/wireguard/wg0.conf (on each node)
+[Interface]
+PrivateKey = <private-key>
+Address = 10.0.0.1/24
+
+[Peer]
+PublicKey = <peer-public-key>
+Endpoint = <peer-public-ip>:51820
+AllowedIPs = 10.0.0.2/32
+```
+
+```yaml
+peers:
+  - name: "wg-peer"
+    url: "http://10.0.0.2:9696"
+    api_key: "${PEER_API_KEY}"
+```
+
+**Requirements:**
+- WireGuard installed on both nodes
+- Manual key generation and exchange
+- Firewall: UDP port 51820 (or your chosen port)
+
 ## Troubleshooting
 
 ### Peer not connecting

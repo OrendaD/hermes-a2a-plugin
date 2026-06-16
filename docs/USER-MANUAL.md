@@ -353,6 +353,59 @@ No additional TLS needed — WARP encrypts traffic between team members.
 
 For detailed CF Zero Trust enrollment, see the [Cloudflare Zero Trust documentation](https://developers.cloudflare/cloudflare-one/connections/connect-networks/).
 
+### Option D: Tailscale / Headscale (mesh VPN)
+
+Tailscale (or its open-source self-hosted counterpart Headscale) creates a mesh VPN with automatic key management and NAT traversal. No firewall rules or port forwarding needed.
+
+```bash
+# Install Tailscale
+# macOS: brew install tailscale
+# Linux: curl -fsSL https://tailscale.com/install.sh | sh
+
+tailscale up
+tailscale ip -4  # shows your Tailscale IP (100.x.x.x)
+```
+
+```yaml
+peers:
+  - name: "tailscale-peer"
+    url: "http://100.x.x.x:9696"
+    api_key: "${PEER_API_KEY}"
+```
+
+Headscale is the self-hosted open-source control server for the WireGuard-based Tailscale protocol. Same UX, you manage the coordination layer.
+
+### Option E: NetBird (mesh VPN)
+
+NetBird is an open-source mesh VPN built on WireGuard with NAT traversal, relay fallback, and peer grouping. Fully open-source with a self-hosted control plane.
+
+```bash
+# Install NetBird
+# macOS: brew install netbird
+# Linux: curl -fsSL https://install.netbird.io/install.sh | sh
+
+netbird up
+netbird status  # shows your NetBird IP
+```
+
+```yaml
+peers:
+  - name: "netbird-peer"
+    url: "http://100.x.x.x:9696"
+    api_key: "${PEER_API_KEY}"
+```
+
+### Option F: WireGuard (manual mesh)
+
+For full control, WireGuard provides a lightweight VPN tunnel. You manage keys and peer configuration manually.
+
+```yaml
+peers:
+  - name: "wg-peer"
+    url: "http://10.0.0.2:9696"
+    api_key: "${PEER_API_KEY}"
+```
+
 ### Verify peer connection
 
 After restarting the gateway on both nodes:
