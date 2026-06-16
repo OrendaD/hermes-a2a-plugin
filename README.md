@@ -266,7 +266,7 @@ A passive health check script verifies the server is running and responsive:
 python scripts/mesh-watchdog.py
 # ✅ A2A watchdog — all clear
 #   ✅  /health: 200 OK
-#   ✅  configured peers: 2 (proteus, partner)
+#   ✅  configured peers: 2 (node-b, partner)
 #   ✅  disk (~/.hermes): 8GB free
 ```
 
