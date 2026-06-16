@@ -2,10 +2,7 @@
 
 A Google A2A v1.0 protocol plugin for [Hermes Agent](https://hermes-agent.nousresearch.com). Enables a mesh of agent nodes — Hermes, OpenClaw, or any A2A-compliant implementation — to discover each other, route tasks by capability, and execute cross-node workflows with provenance tracking, audit logging, and rate limiting.
 
-Two audiences read this file. Both are served.
-
-- **Humans:** scan the sections below for what's possible, where the boundaries are, and how to get started.
-- **Agents:** read every line. A `first-run` test script verifies everything is wired correctly on your system.
+**New to A2A?** Start with the [User Manual](docs/USER-MANUAL.md) — it walks through installation, first task, peer setup, and troubleshooting. The manual covers six networking options: direct TCP, reverse proxy, Cloudflare WARP, Tailscale/Headscale, NetBird, and WireGuard.
 
 ---
 
@@ -16,12 +13,12 @@ Two or more agent nodes connected in a mesh. Each node runs an A2A server (this 
 **Concrete example:**
 
 ```
-Tesla (Hermes) ←→ Proteus (Hermes)
+Node A (Hermes) ←→ Node B (Hermes)
                     ↑
                Partner (OpenClaw)
 ```
 
-Tesla sends a task to Proteus. Proteus routes it to a Partner specialist. The Partner specialist sees `source_node: "tesla"` in the provenance metadata. Everyone knows where the work came from.
+Node A sends a task to Node B. Node B routes it to a Partner specialist. The Partner specialist sees `source_node: "node-a"` in the provenance metadata. Everyone knows where the work came from.
 
 ## Boundaries
 
@@ -103,9 +100,9 @@ hermes:
     node_id: "my-node"
     rate_limit: 60  # requests/min per peer; 0 = disabled
     peers:
-      - name: "proteus"
-        url: "http://proteus.local:9696"
-        api_key: "${PROTEUS_API_KEY}"  # resolved from env at startup
+      - name: "peer-node"
+        url: "http://peer-node.local:9696"
+        api_key: "${PEER_API_KEY}"  # resolved from env at startup
 ```
 
 ## Restart Gateway
@@ -178,7 +175,7 @@ An agent can check the exit code (`0` = pass) and parse the output for `"passed"
             ▼
        ┌──────────┐
        │  Peers   │
-       │ (Proteus,│
+       │ (Node B, │
        │ Partner) │
        └──────────┘
 ```
@@ -225,9 +222,9 @@ Each peer requires three fields:
 ```yaml
 a2a:
   peers:
-    - name: "proteus"                    # Used in routing logs and errors
-      url: "http://proteus.local:9696"   # Peer's A2A server URL
-      api_key: "${PROTEUS_API_KEY}"      # Bearer token (supports ${VAR} syntax)
+    - name: "peer-node"                  # Used in routing logs and errors
+      url: "http://peer-node.local:9696" # Peer's A2A server URL
+      api_key: "${PEER_API_KEY}"         # Bearer token (supports ${VAR} syntax)
 ```
 
 API keys support `${ENV_VAR}` resolution — values are resolved from the environment at startup, keeping keys out of config files checked into git.
@@ -293,6 +290,42 @@ The script is stateless per-tick — it checks, reports, exits. No modifications
 
 ---
 
+# Troubleshooting
+
+If something isn't working, check the [Troubleshooting Guide](docs/references/troubleshooting.md) — it covers 20 common failure scenarios with symptom→cause→fix tables.
+
+Quick diagnosis:
+
+```bash
+# Is the plugin loaded?
+grep "a2a-server" ~/.hermes/logs/agent.log | tail -3
+
+# Is the port listening?
+lsof -i :9696
+
+# Health endpoint
+curl http://127.0.0.1:9696/health
+
+# Agent Card
+curl http://127.0.0.1:9696/.well-known/agent-card.json | python3 -m json.tool
+```
+
+---
+
+# Getting Help
+
+- **Issues:** [GitHub Issues](https://github.com/OrendaD/hermes-a2a-plugin/issues)
+- **A2A Protocol:** [a2a-protocol.org](https://a2a-protocol.org/latest/specification/) | [GitHub](https://github.com/google/A2A)
+- **Hermes Agent:** [Documentation](https://hermes-agent.nousresearch.com/docs) | [GitHub](https://github.com/NousResearch/hermes-agent)
+
+---
+
 # License
 
 Apache 2.0 (matching the A2A SDK license)
+
+---
+
+# Acknowledgments
+
+This plugin builds on the work of [iamagenius00/hermes-a2a-preview](https://github.com/iamagenius00/hermes-a2a-preview), the first A2A protocol implementation for Hermes Agent. That project demonstrated the feasibility of A2A-over-Hermes, validated the SSRF protection model, and established the friend-based auth pattern. The v1.0 plugin in this repository is a ground-up rewrite with a different architecture (hexagonal, protocol-agnostic core) but owes its existence to that proof of concept.
