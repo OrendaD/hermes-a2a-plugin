@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 
 dependencies = [
     "a2a-sdk[http-server,signing]>=1.0.0",
+    "starlette>=1.0.1",
     "uvicorn>=0.30.0",
 ]
 
