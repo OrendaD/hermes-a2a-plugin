@@ -274,26 +274,6 @@ The script is stateless per-tick — it checks, reports, exits. No modifications
 
 ---
 
-## Recent Changes (2026-06-29)
-
-### Bug Fixes
-
-1. **Response format in message mode** (`hermes_executor.py`): Removed `TaskStatusUpdateEvent` emissions from completed/failed code paths. The first `Message` event sets `task_mode=False` in the SDK's `ActiveTaskConsumer`. Emitting a `TaskStatusUpdateEvent` after that raised `InvalidAgentResponseError`. The `Message` alone is the correct terminal response in message mode.
-
-2. **Local dispatch routing** (`fleet_controller.py`): Fixed `_endpoint_for()` to compare `cap.node_id` against `self._local_node_id` instead of hardcoded `"local"`. Profiles with `node_id` matching the local node now correctly get `internal:` endpoints (dispatched via Hermes AIAgent) instead of `a2a://` endpoints (routed via MeshPeerClient).
-
-### Added
-
-- **`plugin.yaml` at repo root**: Required for Hermes plugin discovery. The scanner looks for `plugin.yaml` at the plugin root, not in `src/`. Copied from `src/a2a_plugin/plugin.yaml`.
-
-### Files Changed
-
-| File | Change |
-|------|--------|
-| `src/adapter/hermes_executor.py` | Removed TaskStatusUpdateEvent emissions, added explanatory comments |
-| `src/core/fleet_controller.py` | Fixed `_endpoint_for()` to accept `local_node_id` parameter, updated all call sites |
-| `plugin.yaml` | New file — plugin manifest for Hermes discovery |
-
 ---
 
 ## Repo Docs

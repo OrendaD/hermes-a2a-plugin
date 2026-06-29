@@ -152,6 +152,39 @@ ps aux | grep -i a2a | grep -v grep
 | `~/.hermes/profiles/<name>/config.yaml` | Per-profile A2A config |
 | `~/.hermes/profiles/<name>/.env` | Per-profile signing key |
 
+
+### `InvalidAgentResponseError: Received TaskStatusUpdateEvent in message mode`
+
+**Cause:** The executor emitted a `TaskStatusUpdateEvent` after a `Message` in message mode. The SDK's `ActiveTaskConsumer` sets mode on the first event — `Message` sets message mode, `Task`/`TaskStatusUpdateEvent` sets task mode. Mixing them violates the contract.
+
+**Fix:** Update to plugin version >= 2026-06-29. The executor no longer emits `TaskStatusUpdateEvent` in message mode.
+
+**If still occurring:** Check that the gateway is running the updated plugin code. Restart the gateway after updating.
+
+### Profiles dispatch as remote (`a2a://`) instead of local (`internal:`)
+
+**Cause:** `_endpoint_for()` compared `cap.node_id` against hardcoded `"local"`, but profiles get their `node_id` from A2A config (e.g., `"my-node"`). The mismatch caused all profiles to be treated as remote peers.
+
+**Fix:** Update to plugin version >= 2026-06-29. The function now compares against `self._local_node_id` from config.
+
+**Verify:** Check audit log — `task_in_progress` entries should show `is_remote=false` for local profiles.
+
+### Agent not appearing in Agent Card
+
+**Cause:** Profile `config.yaml` missing `a2a:` section, or `a2a:` section has no `intents` list.
+
+**Fix:** Add to `~/.hermes/profiles/<name>/config.yaml`:
+```yaml
+a2a:
+  intents:
+    - <intent-type>
+  description: "One-line description"
+```
+
+Profiles without `intents` are skipped by discovery.
+
+### `Peer 'X' not connected` in dispatch
+
 ## Related
 
 - [Config Reference](config-reference.md)

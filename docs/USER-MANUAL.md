@@ -138,8 +138,8 @@ curl -s -X POST http://127.0.0.1:9696/a2a/jsonrpc \
     "params": {
       "message": {
         "messageId": "ping-001",
-        "role": "ROLE_USER",
-        "parts": [{"type": "text", "text": "Hello from A2A. Reply with your node name."}]
+        "role": 1,
+        "parts": [{"text": "Hello from A2A. Reply with your node name."}]
       }
     }
   }'
@@ -206,8 +206,8 @@ curl -s -X POST http://<peer-ip>:<port>/a2a/jsonrpc \
     "params": {
       "message": {
         "messageId": "msg-001",
-        "role": "ROLE_USER",
-        "parts": [{"type": "text", "text": "Review the latest commit for security issues."}]
+        "role": 1,
+        "parts": [{"text": "Review the latest commit for security issues."}]
       },
       "metadata": {
         "intent_type": "review"
@@ -430,8 +430,8 @@ curl -s -X POST http://<peer-ip>:9696/a2a/jsonrpc \
     "params": {
       "message": {
         "messageId": "ping-001",
-        "role": "ROLE_USER",
-        "parts": [{"type": "text", "text": "Ping. Reply with your node name."}]
+        "role": 1,
+        "parts": [{"text": "Ping. Reply with your node name."}]
       }
     }
   }'

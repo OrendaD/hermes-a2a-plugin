@@ -2,6 +2,27 @@
 
 Chronological log of build steps for the A2A plugin project (a2a-core).
 
+## 2026-06-29
+
+### Fix — Response format in message mode
+- **What:** Removed `TaskStatusUpdateEvent` emissions from `HermesExecutor` completed/failed code paths. In message mode, the SDK's `ActiveTaskConsumer` sets `task_mode=False` on the first `Message` event. Emitting a `TaskStatusUpdateEvent` after that raised `InvalidAgentResponseError`. The `Message` alone is the correct terminal response.
+- **Root cause:** The executor always emitted both `Message` and `TaskStatusUpdateEvent`. The SDK interprets the first event type as the mode — `Message` sets message mode, `Task` sets task mode. Mixing them violates the mode contract.
+- **Files:** `src/adapter/hermes_executor.py` (modified — removed 2 `emit_status_event` calls, added explanatory comments)
+- **Verified:** `SendMessage` to `localhost:9696/a2a/jsonrpc` returns proper `Message` response.
+
+### Fix — Local dispatch routing
+- **What:** Fixed `_endpoint_for()` in `FleetControllerImpl` to compare `cap.node_id` against `self._local_node_id` instead of hardcoded `"local"`. Profiles with `node_id` matching the local node now get `internal:` endpoints (dispatched via Hermes AIAgent) instead of `a2a://` endpoints (routed via MeshPeerClient).
+- **Root cause:** The function checked `cap.node_id == "local"` but profiles get their `node_id` from the A2A config (e.g., `"atlas-bali"`), which never matched the hardcoded string. All profiles were treated as remote peers.
+- **Files:** `src/core/fleet_controller.py` (modified — `_endpoint_for()` accepts `local_node_id` param, all 5 call sites updated)
+- **Verified:** Local profiles dispatch via `internal:` endpoint, remote profiles still route via `a2a://`.
+
+### Added — Plugin manifest at repo root
+- **What:** Added `plugin.yaml` at the repo root for Hermes plugin discovery. The Hermes plugin scanner looks for `plugin.yaml` at the plugin root directory, not in `src/`. Without this, the plugin was not auto-discovered by Hermes.
+- **Files:** `plugin.yaml` (new)
+
+### Docs — Fix examples in USER-MANUAL.md
+- **What:** Corrected three `SendMessage` examples that used outdated format. `role` field changed from `"ROLE_USER"` (string) to `1` (integer enum). `parts` format changed from `{"type": "text", "text": "..."}` to `{"text": "..."}` (no `type` field).
+- **Files:** `docs/USER-MANUAL.md` (modified — 3 examples fixed)
 ## 2026-05-20
 
 ### Phase 0 — Validation and foundation
