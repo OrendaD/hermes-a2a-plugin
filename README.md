@@ -1,6 +1,8 @@
-# A2A Plugin — Agent-to-Agent Mesh for Hermes
+# A2A Plugin — Agent-to-Agent Messaging for Hermes
 
-A Google A2A v1.0 protocol plugin for [Hermes Agent](https://hermes-agent.nousresearch.com). Enables a mesh of agent nodes — Hermes, OpenClaw, or any A2A-compliant implementation — to discover each other, route tasks by capability, and execute cross-node workflows with provenance tracking, audit logging, and rate limiting.
+A Google A2A v1.0 protocol plugin for [Hermes Agent](https://hermes-agent.nousresearch.com). Enables agent-to-agent communication — both **intra-node** (profiles on the same Hermes instance dispatching tasks to each other) and **cross-node** (mesh of Hermes, OpenClaw, or any A2A-compliant implementation discovering peers, routing by capability, and executing workflows with provenance tracking, audit logging, and rate limiting).
+
+Includes an `a2a-internal` skill (`skills/a2a-internal/SKILL.md`) that agents can load to use A2A messaging — covers the JSON-RPC format, field reference, routing, and pitfalls.
 
 **New to A2A?** Start with the [User Manual](docs/USER-MANUAL.md) — it walks through installation, first task, peer setup, and troubleshooting. The manual covers six networking options: direct TCP, reverse proxy, Cloudflare WARP, Tailscale/Headscale, NetBird, and WireGuard.
 
