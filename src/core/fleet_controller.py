@@ -81,7 +81,7 @@ class FleetControllerImpl(FleetController):
                     task_id=task_id,
                     profile_name=intent.target_profile,
                     node_address=cap.node_id,
-                    endpoint=_endpoint_for(cap),
+                    endpoint=_endpoint_for(cap, self._local_node_id),
                     status="unavailable",
                     message=(
                         f"Profile '{intent.target_profile}' cannot handle "
@@ -95,7 +95,7 @@ class FleetControllerImpl(FleetController):
                     task_id=task_id,
                     profile_name=intent.target_profile,
                     node_address=cap.node_id,
-                    endpoint=_endpoint_for(cap),
+                    endpoint=_endpoint_for(cap, self._local_node_id),
                     status="no_capacity",
                     message=f"Profile '{intent.target_profile}' is busy",
                 )
@@ -105,7 +105,7 @@ class FleetControllerImpl(FleetController):
                 task_id=task_id,
                 profile_name=intent.target_profile,
                 node_address=cap.node_id,
-                endpoint=_endpoint_for(cap),
+                endpoint=_endpoint_for(cap, self._local_node_id),
                 status="dispatched",
             )
 
@@ -149,7 +149,7 @@ class FleetControllerImpl(FleetController):
                 task_id=task_id,
                 profile_name=match.profile_name,
                 node_address=match.node_id,
-                endpoint=_endpoint_for(match),
+                endpoint=_endpoint_for(match, self._local_node_id),
                 status="no_capacity",
                 message=f"Profile '{match.profile_name}' is busy",
             )
@@ -159,7 +159,7 @@ class FleetControllerImpl(FleetController):
             task_id=task_id,
             profile_name=match.profile_name,
             node_address=match.node_id,
-            endpoint=_endpoint_for(match),
+            endpoint=_endpoint_for(match, self._local_node_id),
             status="dispatched",
         )
 
@@ -206,9 +206,14 @@ def _generate_task_id() -> str:
     return f"task/{uuid.uuid4().hex[:12]}"
 
 
-def _endpoint_for(cap: AgentCapability) -> str:
-    """Return the dispatch endpoint string for a capability."""
-    if cap.node_id == "local":
+def _endpoint_for(cap: AgentCapability, local_node_id: str = "local") -> str:
+    """Return the dispatch endpoint string for a capability.
+
+    Profiles whose node_id matches the local node get an ``internal:``
+    endpoint (dispatched locally via Hermes AIAgent).  All others get
+    an ``a2a://`` endpoint (dispatched via MeshPeerClient).
+    """
+    if cap.node_id == local_node_id:
         return f"internal:{cap.profile_name}"
     return f"a2a://{cap.node_id}/{cap.profile_name}"
 

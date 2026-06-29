@@ -1,0 +1,5 @@
+name: a2a-server
+version: "0.1.0"
+description: "A2A Protocol v1.0 HTTP server plugin — enables peer-to-peer agent communication"
+author: Proteus
+kind: standalone

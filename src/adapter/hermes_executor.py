@@ -195,6 +195,8 @@ class HermesExecutor(AgentExecutor):
                 "task_failed", task_id=_audit_tid, context_id=_audit_cid,
                 error=str(exc),
             )
+            # Release profile on exception
+            self._fc.release(_audit_tid, profile)
             return
 
         # 5. Handle result — status transitions + orchestration
@@ -246,14 +248,17 @@ class HermesExecutor(AgentExecutor):
                 "message_sent", task_id=task_id, context_id=context_id,
                 role="agent",
             )
-            await self.emit_status_event(
-                task_id, TaskState.TASK_STATE_COMPLETED,
-                event_queue, final=True,
-            )
+            # NOTE: Do NOT emit TaskStatusUpdateEvent here.
+            # The first Message sets task_mode=False (message mode) in the
+            # SDK's ActiveTaskConsumer. Emitting a TaskStatusUpdateEvent
+            # after that raises InvalidAgentResponseError. The Message
+            # alone is the correct terminal response in message mode.
             self._safe_log(
                 "task_completed", task_id=task_id, context_id=context_id,
                 status="completed",
             )
+            # Release the profile so it can accept new tasks
+            self._fc.release(task_id, profile)
         else:
             # FAILED, CANCELLED, or unknown
             status_text = result.error or f"Status: {result.status}"
@@ -266,14 +271,13 @@ class HermesExecutor(AgentExecutor):
                 "message_sent", task_id=task_id, context_id=context_id,
                 role="agent",
             )
-            await self.emit_status_event(
-                task_id, TaskState.TASK_STATE_FAILED,
-                event_queue, final=True,
-            )
+            # NOTE: Same as above — no TaskStatusUpdateEvent in message mode.
             self._safe_log(
                 "task_failed", task_id=task_id, context_id=context_id,
                 status=result.status, error=result.error or "",
             )
+            # Release the profile even on failure
+            self._fc.release(task_id, profile)
 
     async def cancel(
         self, context: RequestContext, event_queue: EventQueue
@@ -357,7 +361,8 @@ class HermesExecutor(AgentExecutor):
             for key, value in message.metadata.fields.items():
                 metadata[key] = _struct_value_to_python(value)
             intent_type = metadata.pop("intent_type", None)
-
+            logger.info("a2a-debug: metadata=%s, target_profile=%s", metadata, metadata.get("target_profile"))
+            logger.info("a2a-debug: metadata=%s, target_profile=%s", metadata, metadata.get("target_profile"))
         if not intent_type:
             intent_type = _derive_intent_type(parts)
 
@@ -391,8 +396,8 @@ class HermesExecutor(AgentExecutor):
             payload=payload,
             source_node=source_node,
             source_profile=source_profile,
-            target_profile=None,  # FC decides
-            target_node=None,
+            target_profile=metadata.pop("target_profile", None),  # allow caller to target a specific profile
+            target_node=metadata.pop("target_node", None),
             context_id=request_context.context_id or "",
             reference_task_ids=list(message.reference_task_ids) if message else [],
             metadata=metadata,
